@@ -25,9 +25,9 @@ use super::TransportEvent as OuterTransportEvent;
 // Platform-specific serial port discovery, aliased to a common name
 // so call sites are platform-independent.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "usb-udev"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "usb-udev"))]
 use linux as platform;
 
 #[cfg(target_os = "macos")]
@@ -35,11 +35,16 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as platform;
 
-// On unsupported platforms, serial port discovery is a stub so the
-// miner still compiles (e.g., for CPU mining). If this is ever
-// called, something has gone wrong because a board matched a USB
-// device on a platform where we can't find its serial ports.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// On unsupported platforms -- or Linux builds with the `usb-udev` feature
+// off, e.g. the Nano3s device build, whose static link has no libudev and
+// whose boards are on UART, not USB -- serial port discovery is a stub so
+// the miner still compiles. If this is ever called, something has gone
+// wrong because a board matched a USB device on a platform where we can't
+// find its serial ports.
+#[cfg(not(any(
+    all(target_os = "linux", feature = "usb-udev"),
+    target_os = "macos"
+)))]
 mod platform {
     use anyhow::{Result, bail};
     use nusb::DeviceInfo;

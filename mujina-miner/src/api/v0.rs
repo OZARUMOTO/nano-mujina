@@ -16,8 +16,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardFanRequest, BoardLedRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest,
-    BoardTelemetry, BoardTuningRequest, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BoardFanRequest, BoardLedRequest, BoardLedState, BoardPauseRequest, BoardPowerModeRequest,
+    BoardPowerModeState, BoardPowerTargetRequest, BoardTelemetry, BoardTuningRequest,
+    MinerPatchRequest, MinerTelemetry, SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -28,6 +29,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
         .routes(routes!(patch_board_tuning))
+        .routes(routes!(get_board_power_mode, patch_board_power_mode))
         .routes(routes!(patch_board_power_target))
         .routes(routes!(patch_board_fan))
         .routes(routes!(patch_board_pause))
@@ -187,7 +189,10 @@ async fn patch_board_tuning(
     if req.pll_freq_mhz.is_none() && req.voltage_mv.is_none() && req.power_target_w.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // Frequency range check; the four PLL ramp domains must be non-decreasing.
+    // Frequency range check; the four PLL ramp domains must be
+    // non-decreasing. 500MHz is the widest any mode allows; each power
+    // mode's tighter caps (if any) are enforced where they belong -- the
+    // board driver.
     if let Some(f) = req.pll_freq_mhz {
         let in_range = f.iter().all(|&mhz| (100..=500).contains(&mhz));
         let non_decreasing = f[0] <= f[1] && f[1] <= f[2] && f[2] <= f[3];
@@ -195,27 +200,140 @@ async fn patch_board_tuning(
             return Err(StatusCode::BAD_REQUEST);
         }
     }
-    // Voltage range check.
+    // Voltage range check. Same design as power_target_w below: the API
+    // gate is the widest any mode allows (the DC/DC controller's full
+    // register range); each power mode clamps to its own tighter range
+    // in the board driver.
     if let Some(v) = req.voltage_mv
-        && !(3300..=3800).contains(&v)
+        && !(3000..=4095).contains(&v)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // Same range check as the dedicated power-target endpoint.
+    // Same range check as the dedicated power-target endpoint. The 250W
+    // upper bound is deliberately wider than any supported mode's cap
+    // (bypass allows up to 250W for external PSUs); the active mode's
+    // tighter caps are enforced in the board driver, so a
+    // bypass-then-stock downswitch can't strand the device at an
+    // un-commandable (but still hardware-safe) target.
     if let Some(w) = req.power_target_w
-        && !(20.0..=130.0).contains(&w)
+        && !(20.0..=250.0).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
 
     #[cfg(feature = "nano3s")]
     {
-        crate::board::nano3s::write_tuning_command(req.pll_freq_mhz, req.voltage_mv, req.power_target_w)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        crate::board::nano3s::write_tuning_command(
+            req.pll_freq_mhz,
+            req.voltage_mv,
+            req.power_target_w,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok(StatusCode::OK)
     }
     #[cfg(not(feature = "nano3s"))]
     {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+/// Report the board's active power mode and the tuning limits it
+/// enforces.
+///
+/// Only meaningful for the nano3s board driver; other builds report
+/// `stock` with the stock limits (the API's own range checks below are
+/// mode-independent and always the widest this build allows).
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/power-mode",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Active power mode + limits", body = BoardPowerModeState),
+        (status = NOT_FOUND, description = "Board not found"),
+    ),
+)]
+async fn get_board_power_mode(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<BoardPowerModeState>, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "nano3s")]
+    return Ok(Json(crate::board::nano3s::get_power_mode_state()));
+    #[cfg(not(feature = "nano3s"))]
+    {
+        let _ = &name;
+        Ok(Json(BoardPowerModeState {
+            mode: "stock".to_string(),
+            ramp_freq_mhz: [210, 230, 250, 270],
+            voltage_range_mv: [3300, 3800],
+            max_power_target_w: 130.0,
+            safety_trip_w: Some(120.0),
+        }))
+    }
+}
+
+/// Switch the board's power mode live (no reboot required).
+///
+/// `stock` = factory caps + 120W safety trip; `oc` = factory HIGH clock +
+/// trip raised to the 133W hard ceiling (for the stock 140W PSU);
+/// `bypass` = all restraints off (external PSU required). Persists across
+/// reboots. Unknown mode names are rejected with 400.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/power-mode",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = BoardPowerModeRequest,
+    responses(
+        (status = OK, description = "Power mode switched and persisted"),
+        (status = BAD_REQUEST, description = "Missing or unknown mode name"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support power modes"),
+    ),
+)]
+async fn patch_board_power_mode(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<BoardPowerModeRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(mode) = req.mode.as_deref() else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    #[cfg(feature = "nano3s")]
+    {
+        crate::board::nano3s::write_power_mode_command(mode)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        Ok(StatusCode::OK)
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        let _ = mode;
         Err(StatusCode::NOT_IMPLEMENTED)
     }
 }
@@ -253,9 +371,12 @@ async fn patch_board_power_target(
     if !known {
         return Err(StatusCode::NOT_FOUND);
     }
-    // Range check before the value reaches the power-target loop.
+    // Range check before the value reaches the power-target loop. The
+    // 250W upper bound covers every power mode (stock/oc clamp tighter;
+    // see patch_board_tuning's power_target_w comment for why the mode
+    // caps live in the board driver rather than here).
     if let Some(w) = req.target_w
-        && !(20.0..=130.0).contains(&w)
+        && !(20.0..=250.0).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }

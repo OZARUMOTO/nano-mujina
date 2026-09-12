@@ -1,0 +1,57 @@
+# Dockerfile.build -- cross-compile environment for the Nano3s firmware.
+#
+# Two toolchains, one per core (matching the device's own split):
+#   * big core  (rtos_core.elf): Canaan's own RT-Smart toolchain
+#     (riscv64-unknown-linux-musl-rv64imafdcv-lp64d, the exact one the
+#     k230_sdk pins and the fork author used) -- RVV-aware, medany by
+#     default, statically linked musl, which is what RT-Smart's msh
+#     requires (a glibc binary silently fails to start).
+#   * little core (mujina-minerd, nano3s_ui): Rust 1.94 (pinned by
+#     build.Containerfile) targeting riscv64gc-unknown-linux-gnu, linked with
+#     Debian trixie's gcc-riscv64-linux-gnu into fully static glibc binaries
+#     (+crt-static) -- same shape as the fork's own shipped mujina-minerd
+#     (static, "for GNU/Linux 4.15.0"). No libudev needed: the usb-udev
+#     feature is off for the device build (no USB mining hardware; boards
+#     are on UART/IPC), which removes the only libudev consumer.
+#
+# The repo is bind-mounted at build time (not baked in), so rebuilds stay
+# incremental via cargo's target dir on the mounted volume.
+
+FROM docker.io/library/debian:trixie-slim
+
+ARG MUSL_TC_URL=https://kendryte-download.canaan-creative.com/k230/toolchain/riscv64-unknown-linux-musl-rv64imafdcv-lp64d-20230420.tar.bz2
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -y -qq \
+        curl xz-utils bzip2 make git ca-certificates file \
+        gcc libc6-dev \
+        gcc-riscv64-linux-gnu libc6-dev-riscv64-cross \
+    >/dev/null && rm -rf /var/lib/apt/lists/*
+
+# ---- Canaan RT-Smart riscv64 toolchain (big core) -------------------------
+# The exact toolchain k230_sdk's Makefile downloads (RTT_TOOLCHAIN_URL).
+RUN curl -sL --max-time 900 -o /tmp/rtt-tc.tar.bz2 "$MUSL_TC_URL" \
+    && tar xjf /tmp/rtt-tc.tar.bz2 -C /opt && rm /tmp/rtt-tc.tar.bz2 \
+    && mkdir -p /opt/rtt-bin \
+    && ln -s "$(dirname "$(find /opt -maxdepth 4 -name riscv64-unknown-linux-musl-gcc | head -1)")"/* /opt/rtt-bin/ \
+    && /opt/rtt-bin/riscv64-unknown-linux-musl-gcc --version | head -1
+ENV PATH="/opt/rtt-bin:${PATH}"
+
+# ---- Rust 1.94 (build.Containerfile's pinned version) + riscv64 target ---
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH="/usr/local/cargo/bin:${PATH}"
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        --default-toolchain 1.94.0 \
+    && rustup target add riscv64gc-unknown-linux-gnu \
+    && rustc --version
+
+# Little-core link settings: glibc cross-linker, static glibc. RUSTFLAGS here
+# also bypasses the repo's .cargo/config.toml, which -L's the upstream
+# author's home sysroot. The device build passes --no-default-features on
+# the cargo command line so the udev/libudev consumer (usb-udev feature)
+# never enters the link -- see mujina-miner/Cargo.toml's feature docs.
+ENV CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    PKG_CONFIG_ALLOW_CROSS=1
+
+WORKDIR /work
+CMD ["bash"]

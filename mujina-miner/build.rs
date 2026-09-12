@@ -6,24 +6,48 @@ fn main() {
         return;
     }
 
-    // rtos_core lives two levels up from this crate
-    // (mujina-upstream/mujina-miner -> mujina-upstream -> nano3s -> rtos_core).
+    // rtos_core lives next to mujina-miner's parent in this repo's flat
+    // layout (nano-mujina/mujina-miner -> nano-mujina -> rtos_core); the
+    // upstream nested layout (mujina-upstream/mujina-miner ->
+    // mujina-upstream -> nano3s -> rtos_core) puts it three levels up.
+    // Try both so the crate builds from either checkout shape.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let rtos_core = manifest_dir
+    let flat = manifest_dir
+        .parent()
+        .expect("mujina-miner has a parent dir")
+        .join("rtos_core");
+    let nested = manifest_dir
         .parent()
         .expect("mujina-miner has a parent dir")
         .parent()
         .expect("mujina-upstream has a parent dir")
         .join("rtos_core");
+    let rtos_core = if flat.join("tools").join("nano3s_ipc_shim.c").exists() {
+        flat
+    } else {
+        nested
+    };
 
     let tools = rtos_core.join("tools");
     let include = rtos_core.join("include");
     let sdk_libs = rtos_core.join("vendor").join("sdk_libs");
 
-    println!("cargo:rerun-if-changed={}", tools.join("nano3s_ipc_shim.c").display());
-    println!("cargo:rerun-if-changed={}", tools.join("nano3s_ipc_shim.h").display());
-    println!("cargo:rerun-if-changed={}", rtos_core.join("src").join("ipc_protocol.c").display());
-    println!("cargo:rerun-if-changed={}", include.join("ipc_protocol.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        tools.join("nano3s_ipc_shim.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        tools.join("nano3s_ipc_shim.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        rtos_core.join("src").join("ipc_protocol.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        include.join("ipc_protocol.h").display()
+    );
 
     cc::Build::new()
         .file(tools.join("nano3s_ipc_shim.c"))

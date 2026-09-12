@@ -53,7 +53,7 @@ io-kit-sys = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
-udev = { workspace = true }
+udev = { workspace = true, optional = true }
 
 [[bin]]
 name = "mujina-minerd"
@@ -88,8 +88,12 @@ name = "volt_at_freq_probe"
 path = "src/bin/volt_at_freq_probe.rs"
 
 [features]
-default = []
-skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
+default = ["usb-udev"]
+# libudev-based USB serial-port discovery on Linux (transport/usb/linux.rs).
+# Default-on for host/dev builds; the Nano3s device build turns it OFF: the
+# device has no USB mining hardware (its boards are on UART/IPC) and no
+# libudev to link statically.
+usb-udev = ["dep:udev"]
 # Avalon Nano3s board driver (A3197S chain over rtos_core.elf's IPCM
 # protocol). Off by default: build.rs links vendor/sdk_libs/libipcmsg.a,
 # a riscv64 static archive -- enabling this on a native (non-riscv64)

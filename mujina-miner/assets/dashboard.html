@@ -466,16 +466,34 @@
     </div>
     <div class="row">
       <label for="tuneVolt">Core Voltage <small style="color:var(--dim)">mV</small></label>
-      <input type="number" id="tuneVolt" min="3300" max="3800" step="1" value="3704">
+      <input type="number" id="tuneVolt" min="3000" max="4095" step="1" value="3704">
     </div>
     <div class="row">
       <label for="tunePowerTarget">Power Target <small style="color:var(--dim)">W (power-target loop, blank = leave unchanged)</small></label>
-      <input type="number" id="tunePowerTarget" min="20" max="130" step="0.1" value="95">
+      <input type="number" id="tunePowerTarget" min="20" max="250" step="0.1" value="95">
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
       <button class="btn pri" id="tuneApply">Apply Mode</button>
     </div>
     <div class="msg" id="tuneMsg"></div>
+  </div>
+
+  <!-- Power Mode: stock / OC / PSU-bypass -->
+  <div class="sec" id="pmodeSec" style="display:none">Power Mode<span class="sec-sub">stock = factory caps · OC = 133W trip (stock 140W PSU) · bypass = all restraints off (external PSU!)</span></div>
+  <div class="card" id="pmodeCard" style="max-width:560px;display:none">
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" id="pmStock">STOCK</button>
+      <button class="btn" id="pmOc">OC (140W PSU)</button>
+      <button class="btn" id="pmBypass">BYPASS</button>
+    </div>
+    <div id="pmodeInfo" style="margin-top:10px;font-size:12px;color:var(--dim);line-height:1.5"></div>
+    <small style="color:var(--dim);display:block;margin-top:8px">
+      Switching re-ramps the chain and clamps voltage to the mode's range
+      immediately — no reboot. The choice persists in
+      <code>/data/mujina_power_mode</code>. Bypass removes the power safety
+      trip entirely: use it only with an external PSU, never the stock 140W one.
+    </small>
+    <div class="msg" id="pmodeMsg"></div>
   </div>
 
   <!-- Fan Control -->
@@ -1382,6 +1400,8 @@ async function tick() {
       btn.style.color = NANO3S_PAUSED ? 'var(--amber)' : '';
     }
   } catch (e) { /* not a nano3s board, or endpoint unavailable -- leave hidden */ }
+  // Power-mode card -- own try/catch (non-nano3s boards keep it hidden).
+  try { await refreshPowerMode(); } catch (e) { /* leave hidden */ }
 }
 
 // Modal & Forms Sync
@@ -1552,13 +1572,67 @@ async function saveBoardSettings() {
 const TUNE_PRESETS = {
   '210,230,250,270': { freq: [210, 230, 250, 270], volt: 3392, power_target: 62.0 },
   '338,358,378,398': { freq: [338, 358, 378, 398], volt: 3496, power_target: 95.0 },
-  // hashrate_cali.ini's real factory value is 133.0W, but the tuning API
-  // caps power_target_w at 130.0 (a deliberate 3W margin under the
-  // device's 133W hard ceiling, see nano3s.rs's POWER_TARGET_SAFETY_W) --
-  // 133.0 here made the API reject the whole PATCH (freq+volt included,
-  // it's one atomic write), so HIGH mode silently never applied anything.
-  '420,440,460,480': { freq: [420, 440, 460, 480], volt: 3704, power_target: 130.0 },
+  // hashrate_cali.ini's real factory value is 133.0W; the API's hard cap
+  // is 250W (bypass), and the ACTIVE POWER MODE enforces its own tighter
+  // cap in the board driver (stock 130W, OC 133W). On stock mode 133.0
+  // would be clamped to 130 -- switch to OC for the full factory HIGH
+  // envelope.
+  '420,440,460,480': { freq: [420, 440, 460, 480], volt: 3704, power_target: 133.0 },
 };
+
+// Power-mode switcher -- PATCH /api/v0/boards/{name}/power-mode, then
+// GET .../power-mode for the active mode's exact limits. Per-mode caps
+// are enforced by the board driver; this UI just reflects what it
+// reports so operators see what each mode actually allows.
+const PMODE_META = {
+  stock:  { label: 'STOCK',  desc: 'Factory envelope: 210-270MHz ramp, 3300-3800mV, power-target trip at 120W. Safe on the stock 140W PSU.' },
+  oc:     { label: 'OC (140W PSU)', desc: 'Factory HIGH clock: 420-480MHz ramp, 3300-3800mV, trip raised to the 133W hard ceiling. The right mode for overclocking on the stock 140W PSU.' },
+  bypass: { label: 'BYPASS', desc: 'ALL restraints off: up to 500MHz, up to 4095mV, no power safety trip at all. EXTERNAL PSU REQUIRED -- nothing protects the stock 140W supply in this mode.' },
+};
+function renderPowerMode(st) {
+  const meta = PMODE_META[st.mode] || { label: st.mode.toUpperCase(), desc: '' };
+  const trip = st.safety_trip_w == null ? 'none' : st.safety_trip_w + 'W';
+  $('pmodeInfo').innerHTML =
+    `<b style="color:var(--ink)">${meta.label}</b> — ramp ${st.ramp_freq_mhz.join('/')}MHz · ` +
+    `voltage ${st.voltage_range_mv[0]}-${st.voltage_range_mv[1]}mV · max target ${st.max_power_target_w}W · safety trip ${trip}<br>` +
+    meta.desc;
+  for (const [id, mode] of [['pmStock','stock'],['pmOc','oc'],['pmBypass','bypass']]) {
+    $(id).style.opacity = (mode === st.mode) ? '1' : '0.45';
+    $(id).style.borderColor = (mode === st.mode) ? 'var(--cyan)' : '';
+  }
+}
+async function refreshPowerMode() {
+  const board = (LAST && LAST.boards && LAST.boards[0]) ? LAST.boards[0].board_name : null;
+  if (!board) return;
+  $('pmodeSec').style.display = '';
+  $('pmodeCard').style.display = '';
+  try {
+    const r = await fetch(`/api/v0/boards/${encodeURIComponent(board)}/power-mode`);
+    if (!r.ok) return;
+    renderPowerMode(await r.json());
+  } catch (e) { /* board without power-mode support -- leave card but idle */ }
+}
+async function setPowerMode(mode) {
+  const board = (LAST && LAST.boards && LAST.boards[0]) ? LAST.boards[0].board_name : null;
+  if (!board) { $('pmodeMsg').textContent = 'no board detected yet'; $('pmodeMsg').className = 'msg'; return; }
+  $('pmodeMsg').textContent = `switching to ${PMODE_META[mode].label}…`; $('pmodeMsg').className = 'msg';
+  try {
+    const r = await fetch(`/api/v0/boards/${encodeURIComponent(board)}/power-mode`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!r.ok) {
+      const detail = await r.text();
+      $('pmodeMsg').textContent = `power-mode failed (${r.status}): ${detail || 'rejected'}`;
+      $('pmodeMsg').className = 'msg';
+      return;
+    }
+    $('pmodeMsg').textContent = `power mode: ${PMODE_META[mode].label} ✓`;
+    $('pmodeMsg').className = 'msg ok';
+    await refreshPowerMode();
+  } catch (e) { $('pmodeMsg').textContent = 'failed: ' + e; $('pmodeMsg').className = 'msg'; }
+}
 function syncTunePreset() {
   const v = $('tunePreset').value;
   if (v === 'custom') return;
@@ -1605,6 +1679,9 @@ async function applyTuning() {
 }
 $('tunePreset').addEventListener('change', syncTunePreset);
 $('tuneApply').addEventListener('click', applyTuning);
+$('pmStock').addEventListener('click', () => setPowerMode('stock'));
+$('pmOc').addEventListener('click', () => setPowerMode('oc'));
+$('pmBypass').addEventListener('click', () => setPowerMode('bypass'));
 
 // Fan control -- PATCH /api/v0/boards/{name}/fan, handled by
 // mujina_test_harness.c's fan_reactive_check() via HARNESS_CONTROL_FILE.

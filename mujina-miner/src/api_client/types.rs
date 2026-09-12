@@ -124,6 +124,42 @@ pub struct BoardPowerTargetRequest {
     pub target_w: Option<f64>,
 }
 
+/// Request body for `PATCH /api/v0/boards/{name}/power-mode`.
+///
+/// Switches the board's operating envelope live (no reboot): `stock`
+/// (factory caps, 120W safety trip), `oc` (factory HIGH clock, trip
+/// raised to the 133W hard ceiling -- the right mode for the stock 140W
+/// PSU), or `bypass` (all restraints off, external PSU required). The
+/// choice persists in /data/mujina_power_mode across reboots. Range
+/// validation happens in the handler, not here.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardPowerModeRequest {
+    /// `stock`, `oc`, or `bypass`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// Response body for `GET /api/v0/boards/{name}/power-mode`.
+///
+/// Reports the active mode and the exact tuning limits it enforces, so
+/// the dashboard can render each mode's capability readout and clamp its
+/// own inputs to match.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardPowerModeState {
+    /// Active mode: `stock`, `oc`, or `bypass`.
+    pub mode: String,
+    /// PLL ramp target this mode boots/ramps to (four domains, MHz).
+    pub ramp_freq_mhz: [u32; 4],
+    /// Inclusive `[min, max]` core voltage in mV the mode allows.
+    pub voltage_range_mv: [u32; 2],
+    /// Highest power target (W) the mode allows.
+    pub max_power_target_w: f64,
+    /// Watts above which the power-target loop force-steps voltage down
+    /// (`null` = no trip, bypass only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_trip_w: Option<f64>,
+}
+
 /// Request body for `PATCH /api/v0/boards/{name}/fan`.
 ///
 /// Live-edits the fan PID controller (`mujina_test_harness.c`'s

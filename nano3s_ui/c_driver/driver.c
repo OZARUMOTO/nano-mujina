@@ -17,6 +17,11 @@
 
 #define PAGE_FILE "/mntapp/release/linux/app/fb_page"
 #define PIZZA_FILE "/mntapp/release/linux/app/pizza.rgb565"
+/* Optional 240x240 RGB565 boot logo, shown ~5s at boot before the first
+ * telemetry refresh claims the screen (see PG_BOOTLOGO in run_event_loop
+ * and mujina_display_startup.sh). Generated from any image by
+ * tools/make_bootlogo.py; the page stays dark if it's absent. */
+#define BOOTLOGO_FILE "/mntapp/release/linux/app/bootlogo.rgb565"
 /* Written by rtos_core/tools/mujina.c -- plain key=value lines. */
 #define NANO3S_LIVE_FILE "/tmp/nano3s_live.txt"
 /* Written by ble_setup.rs (2026-08-24) -- same key=value format. Since
@@ -72,6 +77,14 @@
  * C_IP_BLUE ever changes. */
 #define C_IP_BLUE_HEX "7fbcff"
 #define C_WHITE lv_color_make(0xff, 0xff, 0xff)
+/* ── Terminal live-page tokens (pure-black terminal, gold accents) ───── */
+#define C_TERM_BG lv_color_make(0x00, 0x00, 0x00)
+#define C_TERM_GREEN lv_color_make(0x33, 0xff, 0x66)
+#define C_TERM_DIM lv_color_make(0x3a, 0x5a, 0x3a)
+#define C_GOLD lv_color_make(0xff, 0xc4, 0x00)
+#define C_GOLD_BRIGHT lv_color_make(0xff, 0xe2, 0x7a)
+#define C_GOLD_DIM lv_color_make(0x6b, 0x52, 0x08)
+#define C_WHITE_HOT lv_color_make(0xff, 0xf6, 0xd8)
 
 /* ── Display flush ────────────────────────────────────────────────────── */
 
@@ -206,14 +219,6 @@ static int kv_bool(const char *key) {
     return s && strcmp(s, "1") == 0;
 }
 
-/* Same thermal thresholds as fb_draw.rs's temp_color_c(). */
-static lv_color_t temp_color_c(double t) {
-    if (t < 38.0) return C_GREEN;
-    if (t < 44.0) return C_YELLOW;
-    if (t < 50.0) return C_ORANGE;
-    return C_RED;
-}
-
 /* ── wlan0 IP lookup (mirrors fb_draw.rs's wlan_ip()) ────────────────────
  * Same `ifconfig wlan0` + "inet addr:" scrape as the original. */
 static int wlan_ip(char *out, size_t out_size) {
@@ -306,13 +311,99 @@ static void style_bg(lv_obj_t *scr, lv_color_t bg) {
 
 static lv_obj_t *scr_waiting, *waiting_label;
 
-static lv_obj_t *scr_live, *live_meter, *live_status, *live_hashrate_big, *live_sub, *live_temp_small, *live_pool_small;
-static lv_meter_scale_t *live_scale, *live_scale_power, *live_scale_temp;
-static lv_meter_indicator_t *live_arc, *live_arc_power, *live_arc_temp;
+/* Terminal-style live page: black background, a shell prompt header, 12
+ * floating ASIC tiles (4x3 grid) with per-chip temp/health, a gold domino
+ * ripple sweeping the grid in step with the WS2812 strip's domino effect,
+ * and a live telemetry footer. Everything gold on black. */
+#define CHIP_COUNT 12
+#define GRID_COLS 4
+/* Round-panel safe zone: the physical display clips the square framebuffer's
+ * corners, so -- like the fork's own fb_draw grid (x0=34 y0=82 cell 41x32) --
+ * everything lives within ~113px of screen center (120,120). Grid: 4x41px
+ * columns + 3x5px gaps = 179px wide at x=30..209 (centered); 3x42px rows at
+ * y=54..190. Text rows are centered (TOP_MID/BOTTOM_MID), never corner-anchored. */
+#define TILE_W 41
+#define TILE_H 42
+#define TILE_GAP 5
+#define GRID_X 30
+#define GRID_Y 54
+
+static lv_obj_t *scr_live;
+static lv_obj_t *term_prompt;   /* header: root@nano3s:~$ */
+static lv_obj_t *term_status;   /* header right: MINING/PAUSED/... */
+static lv_obj_t *term_log;      /* scrolling one-line status log */
+static lv_obj_t *term_stats;    /* footer: HR/PWR/TEMP/EFF line */
+static lv_obj_t *term_prompt2;  /* bottom: nano3s:~$ */
+static lv_obj_t *term_cursor;   /* blinking block cursor */
+static lv_obj_t *term_mode;     /* bottom right: MODE STOCK/OC/BYPASS */
+static lv_obj_t *chip_tile[CHIP_COUNT];
+static lv_obj_t *chip_num[CHIP_COUNT];
+static lv_obj_t *chip_val[CHIP_COUNT];
+
+/* One refresh of the live page (2s) samples this; the ripple/blink
+ * lv_timers animate between refreshes. */
+typedef struct {
+    int present;
+    float temp, ghs, dh;
+    uint32_t hb, nd;
+} chip_live_t;
+
+static chip_live_t g_chips[CHIP_COUNT];
+static float g_prev_temp[CHIP_COUNT];
+static float g_prev_ghs[CHIP_COUNT];
+static float g_flicker[CHIP_COUNT];  /* Vegas flicker energy 0..1 */
+static int g_chips_valid;
+static int g_domino_pos;             /* 0..11, steps every 200ms */
+static int g_cursor_on;
+
+/* ── Domino ripple timer (200ms) ────────────────────────────────────────
+ * Sweeps a bright-gold highlight across the 12 tiles in row-major order,
+ * one tile per tick, with a one-tile decay tail behind the head -- same
+ * cadence as the WS2812 strip's domino effect (also 200ms/LED, driven by
+ * mujina-minerd), so panel and strip read as one sweeping effect. Only
+ * touches borders while scr_live is the active screen; invalidations are
+ * harmless on other pages because lv_timer_handler() is skipped entirely
+ * for the doom/pizza pages that bypass LVGL. */
+static void ripple_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (lv_scr_act() != scr_live) {
+        return;
+    }
+    int head = g_domino_pos;
+    g_domino_pos = (g_domino_pos + 1) % CHIP_COUNT;
+    for (int i = 0; i < CHIP_COUNT; i++) {
+        if (!chip_tile[i]) continue;
+        int d = head - i;
+        if (d < 0) d = -d;
+        lv_color_t border;
+        if (d == 0) border = C_WHITE_HOT;
+        else if (d == 1) border = C_GOLD;
+        else continue; /* only the head + tail change between refreshes */
+        lv_obj_set_style_border_color(chip_tile[i], border, LV_PART_MAIN);
+        lv_obj_invalidate(chip_tile[i]);
+    }
+}
+
+/* ── Cursor blink timer (500ms) ───────────────────────────────────────── */
+static void cursor_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (lv_scr_act() != scr_live) {
+        return;
+    }
+    g_cursor_on = !g_cursor_on;
+    if (g_cursor_on) {
+        lv_obj_clear_flag(term_cursor, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(term_cursor, LV_OBJ_FLAG_HIDDEN);
+    }
+}
 
 static lv_obj_t *scr_diag, *diag_chips_meter, *diag_chips_label, *diag_pll, *diag_voltage, *diag_err;
 static lv_meter_scale_t *diag_chips_scale;
 static lv_meter_indicator_t *diag_chips_arc;
+
+static void build_terminal_screen(void);
+static void refresh_terminal(void);
 
 static lv_obj_t *scr_ip, *ip_caption, *ip_value, *ip_no_wifi;
 
@@ -329,79 +420,8 @@ static void build_screens(void) {
     style_bg(scr_waiting, C_BG);
     waiting_label = make_label(scr_waiting, f24, C_TEXT_1, 112, NULL);
 
-    /* live-nano3s telemetry -- a speedometer-style radial gauge as the
-     * centerpiece (fitting the display's own round physical shape), with
-     * the rest of the telemetry living in its empty center like a car's
-     * trip computer, instead of a plain stacked text list. */
-    scr_live = lv_obj_create(NULL);
-    style_bg(scr_live, C_BG);
-
-    live_meter = lv_meter_create(scr_live);
-    lv_obj_remove_style_all(live_meter);
-    lv_obj_set_size(live_meter, 220, 220);
-    lv_obj_center(live_meter);
-
-    /* Three concentric rings, like a fitness-tracker activity dial:
-     * outer = hashrate (status-colored), middle = chain temp
-     * (thermal-threshold colored), inner = power draw (fixed accent) --
-     * temp and power swapped from their original outer-to-inner order per
-     * user preference. All three now share RING_WIDTH (uniform thickness
-     * per user preference; hashrate used to be thicker than the other
-     * two). No tick marks on any ring (the outer ring's were removed per
-     * user preference) -- all three are legible from fill position +
-     * color alone, backed by the numeric center readout. */
-    live_scale = lv_meter_add_scale(live_meter);
-    lv_meter_set_scale_range(live_meter, live_scale, 0, HASHRATE_GAUGE_MAX, 270, 135);
-
-    live_arc = lv_meter_add_arc(live_meter, live_scale, RING_WIDTH, C_GREEN, -2);
-    lv_meter_set_indicator_start_value(live_meter, live_arc, 0);
-    lv_meter_set_indicator_end_value(live_meter, live_arc, 0);
-
-    live_scale_power = lv_meter_add_scale(live_meter);
-    lv_meter_set_scale_range(live_meter, live_scale_power, 0, POWER_GAUGE_MAX, 270, 135);
-    live_arc_power = lv_meter_add_arc(live_meter, live_scale_power, RING_WIDTH, C_IP_BLUE, -34);
-    lv_meter_set_indicator_start_value(live_meter, live_arc_power, 0);
-    lv_meter_set_indicator_end_value(live_meter, live_arc_power, 0);
-
-    live_scale_temp = lv_meter_add_scale(live_meter);
-    lv_meter_set_scale_range(live_meter, live_scale_temp, 0, TEMP_GAUGE_MAX, 270, 135);
-    live_arc_temp = lv_meter_add_arc(live_meter, live_scale_temp, RING_WIDTH, C_GREEN, -18);
-    lv_meter_set_indicator_start_value(live_meter, live_arc_temp, 0);
-    lv_meter_set_indicator_end_value(live_meter, live_arc_temp, 0);
-
-    live_status = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_status, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_status, C_GREEN, LV_PART_MAIN);
-    lv_obj_align(live_status, LV_ALIGN_CENTER, 0, -34);
-
-    live_hashrate_big = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_hashrate_big, f24, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_1, LV_PART_MAIN);
-    lv_obj_align(live_hashrate_big, LV_ALIGN_CENTER, 0, -8);
-
-    live_sub = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_sub, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_sub, C_TEXT_2, LV_PART_MAIN);
-    lv_label_set_text(live_sub, "TH/S");
-    lv_obj_align(live_sub, LV_ALIGN_CENTER, 0, 16);
-
-    /* Compact "temp * power" readout -- the rings carry the at-a-glance
-     * signal, this is just the precise numbers. */
-    live_temp_small = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_temp_small, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_temp_small, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_align(live_temp_small, LV_ALIGN_CENTER, 0, 36);
-    /* The watt figure gets its own inline color (matching the power ring's
-     * C_IP_BLUE) via LVGL's built-in "#RRGGBB text#" recolor syntax, so it
-     * reads as "that's the power ring's number" at a glance -- the temp
-     * figure alongside it keeps using the label's own style color, which
-     * refresh_live() still sets to the thermal-threshold color each frame. */
-    lv_label_set_recolor(live_temp_small, true);
-
-    live_pool_small = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_pool_small, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_pool_small, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_align(live_pool_small, LV_ALIGN_CENTER, 0, 54);
+    /* live page -- terminal-style: black background, gold ASIC grid. */
+    build_terminal_screen();
 
     /* nano3s-diag */
     scr_diag = lv_obj_create(NULL);
@@ -493,107 +513,280 @@ static void refresh_waiting(const char *msg) {
     lv_scr_load(scr_waiting);
 }
 
-static void refresh_live(void) {
+/* ── Terminal live-page helpers ──────────────────────────────────────── */
+
+/* Temp -> tile color: the same thermal thresholds temp_color_c() uses,
+ * but at the 70C+ end the colors go toward gold/white-hot (Vegas style)
+ * instead of red-dominant, per user preference for this page. */
+static lv_color_t chip_temp_color(float t) {
+    if (t < 38.0f) return C_TERM_GREEN;
+    if (t < 44.0f) return C_GOLD_DIM;
+    if (t < 50.0f) return C_GOLD;
+    return C_WHITE_HOT;
+}
+
+/* A chip is healthy when it's actually reporting work: at least one
+ * nonce seen (nonce_data>0 or nonce_heartbeat>0) and a SmartSpeed fail
+ * rate under 50%. Mirrors how the driver treats a stuck chip as needing
+ * attention regardless of its temperature. */
+static int chip_healthy(const chip_live_t *c) {
+    if (!c->present || (c->hb == 0 && c->nd == 0)) return 0;
+    return c->dh < 50.0f;
+}
+
+/* Vegas flicker: whenever a chip's temp moves up or down vs the previous
+ * refresh, inject flicker energy; it decays on every timer tick so each
+ * tile pops with a rapid gold/white shimmer for a few seconds, like a
+ * casino marquee bulb being jostled. Runs even between telemetry
+ * refreshes so the effect feels alive. */
+static void flicker_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (lv_scr_act() != scr_live || !g_chips_valid) return;
+    for (int i = 0; i < CHIP_COUNT; i++) {
+        if (!chip_tile[i] || !g_chips[i].present) continue;
+        if (g_flicker[i] > 0.0f) {
+            g_flicker[i] -= 0.25f;
+            if (g_flicker[i] < 0.0f) g_flicker[i] = 0.0f;
+        }
+    }
+}
+
+static void build_terminal_screen(void) {
+    const lv_font_t *f14 = &lv_font_montserrat_14;
+    const lv_font_t *f24 = &lv_font_montserrat_24;
+
+    scr_live = lv_obj_create(NULL);
+    style_bg(scr_live, C_TERM_BG);
+
+    /* Header: fake shell prompt + status word (MINING/PAUSED/...).
+     * Centered, not corner-anchored: at y=20 the round panel's visible chord
+     * is ~132px, and the prompt is ~105px -- a TOP_LEFT x=8 anchor put this
+     * text in the clipped corner where its left half was cut off. */
+    term_prompt = lv_label_create(scr_live);
+    lv_obj_set_style_text_font(term_prompt, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(term_prompt, C_TERM_GREEN, LV_PART_MAIN);
+    lv_label_set_text(term_prompt, "root@nano3s:~$");
+    lv_obj_align(term_prompt, LV_ALIGN_TOP_MID, 0, 12);
+
+    term_status = lv_label_create(scr_live);
+    lv_obj_set_style_text_font(term_status, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(term_status, C_GOLD, LV_PART_MAIN);
+    lv_obj_align(term_status, LV_ALIGN_TOP_MID, 0, 32);
+
+    /* One-line status log (last event line, refreshed per update).
+     * Hidden: at 240px round, only ONE centered line fits between the grid
+     * and the bottom prompt, so the essential stats (HR/PWR/temp/shares)
+     * live on term_stats and this detail line would not fit anywhere. */
+    term_log = lv_label_create(scr_live);
+    lv_obj_set_style_text_font(term_log, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(term_log, C_TERM_DIM, LV_PART_MAIN);
+    lv_label_set_text(term_log, "");
+    lv_obj_align(term_log, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_add_flag(term_log, LV_OBJ_FLAG_HIDDEN);
+
+    /* 4x3 grid of floating ASIC tiles -- one per real chip, matching the
+     * board's layout. Black tiles with a gold border; the border doubles
+     * as the health indicator and the domino ripple rides on it. */
+    for (int i = 0; i < CHIP_COUNT; i++) {
+        int row = i / GRID_COLS;
+        int col = i % GRID_COLS;
+
+        lv_obj_t *tile = lv_obj_create(scr_live);
+        lv_obj_remove_style_all(tile);
+        lv_obj_set_size(tile, TILE_W, TILE_H);
+        lv_obj_set_pos(tile, GRID_X + col * (TILE_W + TILE_GAP), GRID_Y + row * (TILE_H + TILE_GAP));
+        lv_obj_set_style_radius(tile, 6, LV_PART_MAIN);
+        lv_obj_set_style_border_width(tile, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(tile, C_GOLD_DIM, LV_PART_MAIN);
+        lv_obj_set_style_border_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(tile, C_TERM_BG, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(tile, LV_OPA_50, LV_PART_MAIN);
+
+        lv_obj_t *num = lv_label_create(tile);
+        lv_obj_set_style_text_font(num, f14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(num, C_GOLD, LV_PART_MAIN);
+        lv_obj_align(num, LV_ALIGN_TOP_MID, 0, 2);
+
+        lv_obj_t *val = lv_label_create(tile);
+        lv_obj_set_style_text_font(val, f14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(val, C_GOLD_BRIGHT, LV_PART_MAIN);
+        lv_obj_align(val, LV_ALIGN_BOTTOM_MID, 0, -3);
+
+        chip_tile[i] = tile;
+        chip_num[i] = num;
+        chip_val[i] = val;
+    }
+
+    /* Telemetry footer: HR / PWR / temp / shares, one centered line at
+     * y=194 (visible chord there is ~168px; the old 270px TOP_LEFT line at
+     * y=198 lost both ends off the round panel). */
+    term_stats = lv_label_create(scr_live);
+    lv_obj_set_style_text_font(term_stats, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(term_stats, C_GOLD_BRIGHT, LV_PART_MAIN);
+    lv_obj_align(term_stats, LV_ALIGN_TOP_MID, 0, 194);
+
+    /* Bottom prompt + blinking cursor, centered as a pair (the panel's
+     * chord at y~220 is only ~120px, so a BOTTOM_LEFT anchor was clipped). */
+    term_prompt2 = lv_label_create(scr_live);
+    lv_obj_set_style_text_font(term_prompt2, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(term_prompt2, C_TERM_GREEN, LV_PART_MAIN);
+    lv_label_set_text(term_prompt2, "nano3s:~$");
+    lv_obj_align(term_prompt2, LV_ALIGN_TOP_MID, -40, 216);
+
+    term_cursor = lv_obj_create(scr_live);
+    lv_obj_remove_style_all(term_cursor);
+    lv_obj_set_size(term_cursor, 8, 16);
+    lv_obj_set_style_bg_color(term_cursor, C_GOLD, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(term_cursor, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_align(term_cursor, LV_ALIGN_TOP_MID, 40, 216);
+
+    /* Mode badge: merged into the status line ("MINING · STOCK") because
+     * the BOTTOM_RIGHT corner is clipped on the round panel. Object kept
+     * alive (refresh still writes it) but permanently hidden. */
+    term_mode = lv_label_create(scr_live);
+    lv_obj_set_style_text_font(term_mode, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(term_mode, C_GOLD, LV_PART_MAIN);
+    lv_obj_align(term_mode, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_add_flag(term_mode, LV_OBJ_FLAG_HIDDEN);
+
+    /* Unused-but-kept-alive pointers so the f24 var doesn't warn. */
+    (void)f24;
+}
+
+static void refresh_terminal(void) {
+
+    /* Status word + color, same logic as the old gauge page. */
     int pool_connected = kv_bool("pool_connected");
     int ipc_connected = kv_bool("ipc_connected");
     int have_hashrate = kv_str("hashrate_ghs") != NULL;
     int paused = kv_bool("paused");
-
     const char *status_text;
     lv_color_t status_color;
     if (paused) {
         status_text = "PAUSED";
-        status_color = C_YELLOW;
+        status_color = C_TERM_DIM;
     } else if (pool_connected && ipc_connected && have_hashrate) {
         status_text = "MINING";
-        status_color = C_GREEN;
+        status_color = C_TERM_GREEN;
     } else if (pool_connected || ipc_connected) {
         status_text = "CONNECTING";
-        status_color = C_YELLOW;
+        status_color = C_GOLD;
     } else {
         status_text = "OFFLINE";
         status_color = C_RED;
     }
-    lv_label_set_text(live_status, status_text);
-    lv_obj_set_style_text_color(live_status, status_color, LV_PART_MAIN);
+    lv_label_set_text(term_status, status_text);
+    lv_obj_set_style_text_color(term_status, status_color, LV_PART_MAIN);
 
-    /* lv_meter has no post-creation indicator-color setter -- the struct
-     * is public (lv_meter.h), so mutate the field directly and invalidate
-     * to force a redraw with the new color. */
-    live_arc->type_data.arc.color = status_color;
-
-    char buf[64];
-    uint32_t ghs;
-    int32_t gauge_deciTH = 0;
-    if (paused) {
-        lv_label_set_text(live_hashrate_big, "IDLE");
-        lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_3, LV_PART_MAIN);
-    } else if (kv_u32("hashrate_ghs", &ghs) && ghs > 0) {
-        snprintf(buf, sizeof(buf), "%.2f", ghs / 1000.0);
-        lv_label_set_text(live_hashrate_big, buf);
-        lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_1, LV_PART_MAIN);
-        gauge_deciTH = (int32_t)((ghs + 50) / 100);
-        if (gauge_deciTH > HASHRATE_GAUGE_MAX) {
-            gauge_deciTH = HASHRATE_GAUGE_MAX;
+    /* Snapshot the chip lines into g_chips; missing/absent = offline. */
+    int any_chip = 0;
+    for (int i = 0; i < CHIP_COUNT; i++) {
+        g_prev_temp[i] = g_chips[i].temp;
+        g_prev_ghs[i] = g_chips[i].ghs;
+        chip_live_t c;
+        memset(&c, 0, sizeof(c));
+        char key[16];
+        snprintf(key, sizeof(key), "chip%d", i);
+        const char *s = kv_str(key);
+        if (s) {
+            /* chipN=temp,ghs,dh,hb,nd */
+            float f0, f1, f2;
+            uint32_t hb, nd;
+            int n = sscanf(s, "%f,%f,%f,%u,%u", &f0, &f1, &f2, &hb, &nd);
+            if (n == 5) {
+                c.present = 1;
+                c.temp = f0;
+                c.ghs = f1;
+                c.dh = f2;
+                c.hb = hb;
+                c.nd = nd;
+                any_chip = 1;
+            }
         }
-    } else {
-        lv_label_set_text(live_hashrate_big, "--");
-        lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_3, LV_PART_MAIN);
+        g_chips[i] = c;
     }
-    lv_meter_set_indicator_end_value(live_meter, live_arc, gauge_deciTH);
+    g_chips_valid = any_chip;
 
-    /* Power ring -- fixed accent color (this one isn't a pass/fail signal
-     * like temp is, just "how close to the fill"), clamped to the gauge's
-     * own range so an out-of-range reading still shows as visually maxed
-     * rather than silently misbehaving. */
-    double power_w;
-    int have_power = kv_f64("power_w", &power_w);
-    int32_t gauge_power = 0;
-    if (have_power) {
-        gauge_power = (int32_t)(power_w + 0.5);
-        if (gauge_power < 0) gauge_power = 0;
-        if (gauge_power > POWER_GAUGE_MAX) gauge_power = POWER_GAUGE_MAX;
+    /* Per-tile redraw: health border, temp-colored value, Vegas flicker
+     * pop whenever this chip's temp or hashrate moved since last time. */
+    for (int i = 0; i < CHIP_COUNT; i++) {
+        if (!chip_tile[i]) continue;
+        if (!g_chips[i].present) {
+            lv_label_set_text(chip_num[i], "--");
+            lv_obj_set_style_text_color(chip_num[i], C_TERM_DIM, LV_PART_MAIN);
+            lv_label_set_text(chip_val[i], "OFF");
+            lv_obj_set_style_text_color(chip_val[i], C_TERM_DIM, LV_PART_MAIN);
+            lv_obj_set_style_border_color(chip_tile[i], C_TERM_DIM, LV_PART_MAIN);
+            lv_obj_set_style_border_opa(chip_tile[i], LV_OPA_40, LV_PART_MAIN);
+        } else {
+            char v[12];
+            snprintf(v, sizeof(v), "A%02d", i + 1);
+            lv_label_set_text(chip_num[i], v);
+            lv_obj_set_style_text_color(chip_num[i], C_GOLD, LV_PART_MAIN);
+
+            snprintf(v, sizeof(v), "%.0fC", g_chips[i].temp);
+            lv_label_set_text(chip_val[i], v);
+            lv_color_t tc = chip_temp_color(g_chips[i].temp);
+            lv_obj_set_style_text_color(chip_val[i], tc, LV_PART_MAIN);
+
+            lv_obj_set_style_border_opa(chip_tile[i], LV_OPA_COVER, LV_PART_MAIN);
+            if (chip_healthy(&g_chips[i])) {
+                lv_obj_set_style_border_color(chip_tile[i], C_GOLD, LV_PART_MAIN);
+            } else {
+                lv_obj_set_style_border_color(chip_tile[i], C_RED, LV_PART_MAIN);
+            }
+
+            /* Vegas pop on temp/hashrate movement. */
+            float dt = g_chips[i].temp - g_prev_temp[i];
+            float dg = g_chips[i].ghs - g_prev_ghs[i];
+            if ((dt > 0.5f || dt < -0.5f || dg > 0.2f || dg < -0.2f) && g_flicker[i] < 0.5f) {
+                g_flicker[i] = 1.0f;
+            }
+            if (g_flicker[i] > 0.0f) {
+                /* Flicker shifts the tile's value text between gold and
+                 * white-hot -- a rapid shimmer while the energy decays. */
+                lv_color_t flick = (g_flicker[i] > 0.5f) ? C_WHITE_HOT : C_GOLD_BRIGHT;
+                lv_obj_set_style_text_color(chip_val[i], flick, LV_PART_MAIN);
+                lv_obj_set_style_border_color(chip_tile[i], flick, LV_PART_MAIN);
+            }
+        }
+        lv_obj_invalidate(chip_tile[i]);
     }
-    lv_meter_set_indicator_end_value(live_meter, live_arc_power, gauge_power);
 
-    /* Temp ring -- same thermal-threshold coloring as the rest of the UI. */
-    double avg;
-    int have_temp = kv_f64("temp_avg", &avg);
-    int32_t gauge_temp = 0;
-    lv_color_t temp_color = C_TEXT_3;
-    if (have_temp) {
-        gauge_temp = (int32_t)(avg + 0.5);
-        if (gauge_temp < 0) gauge_temp = 0;
-        if (gauge_temp > TEMP_GAUGE_MAX) gauge_temp = TEMP_GAUGE_MAX;
-        temp_color = temp_color_c(avg);
-    }
-    live_arc_temp->type_data.arc.color = temp_color;
-    lv_meter_set_indicator_end_value(live_meter, live_arc_temp, gauge_temp);
-
-    lv_obj_invalidate(live_meter);
-
-    /* Compact center readout -- the rings already carry hashrate/power/temp
-     * at a glance, this is just the precise numbers, kept terse since the
-     * innermost ring's clearance (inside the temp ring) is only ~58px
-     * radius before running into the rings' fixed start point at the
-     * 135 degree (bottom-left) position. Full diff/PLL/voltage detail is
-     * one button press away on the diagnostics page. */
-    if (have_temp && have_power) {
-        snprintf(buf, sizeof(buf), "%.1fC  #" C_IP_BLUE_HEX " %.0fW#", avg, power_w);
-    } else if (have_temp) {
-        snprintf(buf, sizeof(buf), "%.1fC", avg);
-    } else if (have_power) {
-        snprintf(buf, sizeof(buf), "#" C_IP_BLUE_HEX " %.0fW#", power_w);
-    } else {
-        snprintf(buf, sizeof(buf), "--");
-    }
-    lv_label_set_text(live_temp_small, buf);
-    lv_obj_set_style_text_color(live_temp_small, temp_color, LV_PART_MAIN);
-
+    /* Footer: hashrate / power / shares. */
+    uint32_t ghs = 0;
+    double pw = 0.0, avg = 0.0, eff = 0.0;
+    int have_pw = kv_f64("power_w", &pw);
+    int have_avg = kv_f64("temp_avg", &avg);
+    kv_u32("hashrate_ghs", &ghs);
     const char *shares = kv_str("shares_found");
-    lv_label_set_text(live_pool_small, shares ? shares : "0");
+    if (have_pw && ghs > 0) eff = pw / (ghs / 1000.0);
+
+    /* One centered footer line: the essentials only (EFF/Difficulty were
+     * dropped -- they made the line 270px wide on a 240px round panel). */
+    char l1[96];
+    snprintf(l1, sizeof(l1), "%.2fTH/s %.0fW %.0fC S%s",
+             ghs / 1000.0, pw, have_avg ? avg : 0.0,
+             shares ? shares : "0");
+    lv_label_set_text(term_stats, l1);
+
+    /* Mode (stock/oc/bypass) merged into the centered status line. */
+    const char *mode = kv_str("mode");
+    {
+        char combined[48];
+        snprintf(combined, sizeof(combined), "%s \u00b7 %s", status_text,
+                 mode ? mode : "--");
+        lv_label_set_text(term_status, combined);
+        lv_obj_set_style_text_color(term_status, status_color, LV_PART_MAIN);
+    }
 
     lv_scr_load(scr_live);
+}
+
+static void refresh_live(void) {
+    /* The live page is now the terminal-style ASIC grid (see
+     * build_terminal_screen()); the old radial-gauge page is gone. */
+    refresh_terminal();
 }
 
 static void refresh_diag(void) {
@@ -735,46 +928,65 @@ static void refresh_wifi_setup(void) {
     lv_scr_load(scr_wifi_setup);
 }
 
-/* Raw full-screen static image -- bypasses LVGL entirely, same as
- * fb_draw.rs's Screen::load_image()+flush() for this page. Drawn once on
- * page-change only (the source image never changes, unlike the original's
- * unconditional periodic redraw). */
-static void refresh_pizza(void) {
-    static uint8_t pizza_buf[FB_BYTES];
-    FILE *f = fopen(PIZZA_FILE, "rb");
+/* Shared raw-framebuffer blit: streams a full 240x240 RGB565 file
+ * straight into /dev/fb0, no LVGL involved. Returns 0 on success. Used
+ * by both static-image pages (pizza, bootlogo). */
+static int blit_raw_image(const char *path, uint8_t *buf) {
+    FILE *f = fopen(path, "rb");
     if (!f) {
-        return;
+        return -1;
     }
-    size_t n = fread(pizza_buf, 1, sizeof(pizza_buf), f);
+    size_t n = fread(buf, 1, FB_BYTES, f);
     fclose(f);
-    if (n != sizeof(pizza_buf)) {
-        return;
+    if (n != FB_BYTES) {
+        return -1;
     }
     int fd = open(FB_DEV, O_WRONLY);
     if (fd < 0) {
-        return;
+        return -1;
     }
     lseek(fd, 0, SEEK_SET);
     size_t written = 0;
-    while (written < sizeof(pizza_buf)) {
-        ssize_t wn = write(fd, pizza_buf + written, sizeof(pizza_buf) - written);
+    while (written < FB_BYTES) {
+        ssize_t wn = write(fd, buf + written, FB_BYTES - written);
         if (wn <= 0) {
             break;
         }
         written += (size_t)wn;
     }
     close(fd);
+    return written == FB_BYTES ? 0 : -1;
+}
+
+/* Raw full-screen static image -- bypasses LVGL entirely, same as
+ * fb_draw.rs's Screen::load_image()+flush() for this page. Drawn once on
+ * page-change only (the source image never changes, unlike the original's
+ * unconditional periodic redraw). */
+static void refresh_pizza(void) {
+    static uint8_t pizza_buf[FB_BYTES];
+    (void)blit_raw_image(PIZZA_FILE, pizza_buf);
+}
+
+/* Boot logo -- same raw-image bypass as pizza, from bootlogo.rgb565 (a
+ * 240x240 RGB565 file generated by tools/make_bootlogo.py; see
+ * mujina_display_startup.sh for how the 5s hold works). Missing file or
+ * partial file just leaves the screen black -- this page is a nicety,
+ * never worth blocking boot over. */
+static void refresh_bootlogo(void) {
+    static uint8_t logo_buf[FB_BYTES];
+    (void)blit_raw_image(BOOTLOGO_FILE, logo_buf);
 }
 
 /* ── Page-file polling loop (mirrors fb_draw.rs's run_live_nano3s()) ────── */
 
-typedef enum { PG_LIVE, PG_DIAG, PG_IP, PG_PIZZA, PG_DOOM, PG_WIFI_SETUP } page_t;
+typedef enum { PG_LIVE, PG_DIAG, PG_IP, PG_PIZZA, PG_DOOM, PG_WIFI_SETUP, PG_BOOTLOGO } page_t;
 
 static page_t parse_page(const char *s) {
     if (strcmp(s, "nano3s-diag") == 0) return PG_DIAG;
     if (strcmp(s, "ip") == 0) return PG_IP;
     if (strcmp(s, "pizza") == 0) return PG_PIZZA;
     if (strcmp(s, "wifi-setup") == 0) return PG_WIFI_SETUP;
+    if (strcmp(s, "bootlogo") == 0) return PG_BOOTLOGO;
     /* "doom" fully yields /dev/fb0 -- nano3s_doom owns the panel while
      * this page is selected, same idea as the pizza page's raw-image
      * bypass, just taken further: no refresh, no lv_timer_handler at all,
@@ -832,6 +1044,10 @@ static void run_event_loop(void) {
                 if (page_changed) {
                     refresh_pizza();
                 }
+            } else if (pg == PG_BOOTLOGO) {
+                if (page_changed) {
+                    refresh_bootlogo();
+                }
             } else if (pg == PG_WIFI_SETUP) {
                 refresh_wifi_setup();
             } else if (read_kv_file(NANO3S_LIVE_FILE)) {
@@ -845,7 +1061,11 @@ static void run_event_loop(void) {
             }
         }
 
-        if (pg != PG_PIZZA) {
+        /* Same rationale as pizza's raw-image bypass: while a raw-blit
+         * page owns the panel, lv_timer_handler() must not run -- LVGL
+         * would redraw whatever screen was last loaded straight over
+         * the logo/image. */
+        if (pg != PG_PIZZA && pg != PG_BOOTLOGO) {
             lv_timer_handler();
         }
         usleep(POLL_INTERVAL_MS * 1000);
@@ -887,6 +1107,14 @@ int nano3s_ui_run(void) {
 
     build_screens();
     refresh_waiting("STARTING");
+
+    /* Animation timers for the terminal live page: the 200ms domino
+     * ripple (matched to the WS2812 strip's 200ms/LED domino effect in
+     * mujina-minerd) and the 500ms block-cursor blink. Both no-op unless
+     * scr_live is the active screen. */
+    lv_timer_create(ripple_timer_cb, 200, NULL);
+    lv_timer_create(cursor_timer_cb, 500, NULL);
+    lv_timer_create(flicker_timer_cb, 250, NULL);
 
     run_event_loop();
     return 0;

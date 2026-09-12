@@ -14,8 +14,8 @@
 # mining -- see the pushed nano-mujina repo history for why.
 #
 # What this pushes:
-#   - rtos_core.elf + tools/init.sh          -> /sharefs/
-#   - mujina-minerd                          -> /data/
+#   - rtos_core.elf + tools/init.sh          -> /sharefs/# - mujina-minerd (mujina-miner/ at the repo root; falls back to the
+#   pre-split mujina-upstream/ layout)      -> /data/
 #   - wdt_disable_hold, mujina_test_harness  -> built fresh from source
 #     (rebuilding here, not committing binaries, matches how rtos_core.elf
 #     and mujina-minerd are already handled)
@@ -48,7 +48,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RTOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$RTOS_ROOT/.." && pwd)"
 RTOS_ELF="$RTOS_ROOT/build/rtos_core.elf"
-MUJINA_MINERD="$PROJECT_ROOT/mujina-upstream/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped"
+# Standalone-repo layout: mujina-miner/ sits at the repo root next to
+# rtos_core/ (the pre-split upstream nested it under mujina-upstream/).
+MUJINA_MINERD="$PROJECT_ROOT/mujina-miner/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped"
+if [ ! -f "$MUJINA_MINERD" ] && [ -f "$PROJECT_ROOT/mujina-upstream/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped" ]; then
+    # Fall back to the upstream nested layout if someone still has it.
+    MUJINA_MINERD="$PROJECT_ROOT/mujina-upstream/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped"
+fi
 SSH="ssh -o StrictHostKeyChecking=no root@$DEVICE_IP"
 SCP="scp -o StrictHostKeyChecking=no"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -99,6 +105,16 @@ for f in "$BUILD_DIR/wdt_disable_hold" "$BUILD_DIR/mujina_test_harness" \
     $SCP "$f" "root@$DEVICE_IP:/mntapp/release/linux/app/$name.new"
     $SSH "chmod +x /mntapp/release/linux/app/$name.new && mv /mntapp/release/linux/app/$name.new /mntapp/release/linux/app/$name"
 done
+
+echo "[*] Pushing boot logo, if one has been generated..."
+# Optional -- tools/make_bootlogo.py generates it (see README's Custom
+# Boot Logo). Without it the device just boots straight to the live UI.
+if [ -f "$PROJECT_ROOT/tools/bootlogo.rgb565" ]; then
+    $SCP "$PROJECT_ROOT/tools/bootlogo.rgb565" "root@$DEVICE_IP:/mntapp/release/linux/app/bootlogo.rgb565.new"
+    $SSH "mv /mntapp/release/linux/app/bootlogo.rgb565.new /mntapp/release/linux/app/bootlogo.rgb565"
+else
+    echo "    (tools/bootlogo.rgb565 not found -- skipping)"
+fi
 
 echo "[*] Pushing the new rcS (replaces stock rcS entirely)..."
 $SCP "$SCRIPT_DIR/rcS" "root@$DEVICE_IP:/etc/init.d/rcS.new"

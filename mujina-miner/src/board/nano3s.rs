@@ -239,6 +239,171 @@ const NANO3S_PLL_FREQ_TARGET: [u32; 4] = [210, 230, 250, 270];
 /// telemetry (cal_ghsmm() in rtos_core/src/toast.c) arrives.
 const NANO3S_EXPECTED_HASHRATE_GHS: f64 = 100.0;
 
+/// Operating mode selectable from the dashboard/API. Each mode bundles the
+/// PLL ramp target, voltage clamp, and power-target safety trip that this
+/// driver and the API enforce -- "restraints off" is a per-mode choice,
+/// not a global removal, so a fresh install always boots conservative.
+///
+/// - **Stock** (default): the factory LOW ramp, the stock 3800mV voltage
+///   ceiling, and a 120W hard safety trip. Safe on the 140W stock PSU.
+/// - **OC**: the factory HIGH ramp with the power-target safety trip
+///   raised to the device's measured 133W hard ceiling, so a 130W target
+///   is actually reachable (stock mode's 120W trip would fight it). Still
+///   tuned for the 140W stock PSU.
+/// - **Bypass**: every software restraint off -- the API's full 500MHz
+///   frequency range, voltage past the stock ceiling, and no power
+///   safety trip at all. For an external PSU only; nothing here protects
+///   the stock supply past 133W.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerMode {
+    /// Factory-calibrated operating envelope (default).
+    Stock,
+    /// Factory HIGH clock, safety trip raised to the 133W hard ceiling.
+    /// The right mode for OC on the stock 140W PSU.
+    Overclock,
+    /// All restraints off -- unlimited clock/voltage, no safety trip.
+    /// External PSU required.
+    Bypass,
+}
+
+impl PowerMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PowerMode::Stock => "stock",
+            PowerMode::Overclock => "oc",
+            PowerMode::Bypass => "bypass",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stock" => Some(PowerMode::Stock),
+            "oc" => Some(PowerMode::Overclock),
+            "bypass" => Some(PowerMode::Bypass),
+            _ => None,
+        }
+    }
+
+    /// PLL ramp target sent as IPC_MSG_SET_MODE's pll_freq[4] --
+    /// `[target, target+interval, target+2i, target+3i]` (see
+    /// NANO3S_PLL_FREQ_TARGET's doc comment for the encoding). Bypass
+    /// keeps the factory HIGH default; the mode removes the *caps*, the
+    /// operator still chooses the actual clocks via the tuning API.
+    fn ramp_target(self) -> [u32; 4] {
+        match self {
+            PowerMode::Stock => NANO3S_PLL_FREQ_TARGET,
+            PowerMode::Overclock | PowerMode::Bypass => [420, 440, 460, 480],
+        }
+    }
+
+    /// Inclusive voltage clamp applied to every commanded voltage in this
+    /// mode: live tuning commands, power-target loop steps, and the
+    /// voltage reapplied after resume. OC keeps the stock 3800mV ceiling
+    /// (the stock PSU runs out of watts before 3800mV stops being the
+    /// right limit); Bypass lifts it to the DC/DC controller's full
+    /// register range.
+    fn voltage_range_mv(self) -> (i32, i32) {
+        match self {
+            PowerMode::Stock | PowerMode::Overclock => (3300, 3800),
+            PowerMode::Bypass => (3000, 4095),
+        }
+    }
+
+    /// Watts above which the power-target loop force-steps voltage down
+    /// immediately, regardless of target or interval. `None` disables the
+    /// trip (Bypass only).
+    fn safety_trip_w(self) -> Option<f64> {
+        match self {
+            PowerMode::Stock => Some(120.0),
+            PowerMode::Overclock => Some(133.0),
+            PowerMode::Bypass => None,
+        }
+    }
+
+    /// Widest voltage the REST API may command in this mode (see
+    /// `patch_board_tuning`'s range check). Same clamp the board driver
+    /// applies, expressed for the API's u32 values.
+    fn api_voltage_range_mv(self) -> (u32, u32) {
+        let (vmin, vmax) = self.voltage_range_mv();
+        (vmin as u32, vmax as u32)
+    }
+
+    /// Highest power target the REST API may set in this mode. Stock/OC
+    /// stay short of the device's 133W hard ceiling; Bypass allows a
+    /// target beyond it for external PSUs (the loop itself is still just
+    /// a +/-26mV servo, and its safety trip is off in this mode).
+    fn api_max_power_target_w(self) -> f64 {
+        match self {
+            PowerMode::Stock => 130.0,
+            PowerMode::Overclock => 133.0,
+            PowerMode::Bypass => 250.0,
+        }
+    }
+}
+
+/// Where the selected mode persists across reboots. /data is the
+/// flash-backed writable partition (stock firmware already keeps
+/// /data/factory there); a /tmp path would reset to Stock every boot.
+const POWER_MODE_FILE: &str = "/data/mujina_power_mode";
+
+/// Reads the persisted mode, falling back to Stock (with a warning) if
+/// the file is missing or holds an unrecognized value.
+fn load_power_mode() -> PowerMode {
+    match std::fs::read_to_string(POWER_MODE_FILE) {
+        Ok(s) => match PowerMode::parse(s.trim()) {
+            Some(mode) => {
+                eprintln!(
+                    "[nano3s] power mode: {} (from {POWER_MODE_FILE})",
+                    mode.as_str()
+                );
+                mode
+            }
+            None => {
+                eprintln!(
+                    "[nano3s] unrecognized power mode '{}' in {POWER_MODE_FILE} -- using stock",
+                    s.trim()
+                );
+                PowerMode::Stock
+            }
+        },
+        Err(_) => PowerMode::Stock,
+    }
+}
+
+fn save_power_mode(mode: PowerMode) {
+    if let Err(e) = std::fs::write(POWER_MODE_FILE, mode.as_str()) {
+        eprintln!("[nano3s] failed to persist power mode to {POWER_MODE_FILE}: {e}");
+    }
+}
+
+/// Current mode + its limits, for `GET /api/v0/boards/{name}/power-mode`
+/// (the dashboard renders these as the mode card's capability readout).
+pub(crate) fn get_power_mode_state() -> crate::api_client::types::BoardPowerModeState {
+    let mode = load_power_mode();
+    let (vmin, vmax) = mode.api_voltage_range_mv();
+    crate::api_client::types::BoardPowerModeState {
+        mode: mode.as_str().to_string(),
+        ramp_freq_mhz: mode.ramp_target(),
+        voltage_range_mv: [vmin, vmax],
+        max_power_target_w: mode.api_max_power_target_w(),
+        safety_trip_w: mode.safety_trip_w(),
+    }
+}
+
+/// Live-switches the operating mode by writing `mode:<name>` to
+/// [`MUJINA_CONTROL_FILE`] for `run_worker()` to apply (it persists the
+/// choice, re-ramps to the mode's target, and clamps the latched voltage
+/// into the new mode's range). Returns an error string (for the handler
+/// to turn into a 400) on an unknown mode name.
+pub(crate) fn write_power_mode_command(mode: &str) -> Result<(), String> {
+    if PowerMode::parse(mode).is_none() {
+        return Err(format!(
+            "unknown power mode '{mode}' (want stock/oc/bypass)"
+        ));
+    }
+    std::fs::write(MUJINA_CONTROL_FILE, format!("mode:{mode}")).map_err(|e| e.to_string())
+}
+
 /// Ceiling on a single nonce's recorded difficulty for the fleet-level
 /// hashrate estimator. `verify_and_build_share()` records every reported
 /// nonce's achieved difficulty; `Difficulty::from_hash()` returns
@@ -261,19 +426,10 @@ const POWER_TARGET_STEP_MV: i32 = 26;
 /// Dead-band around the target -- avoids stepping on every check for
 /// sample-to-sample noise in `ina_power_w`.
 const POWER_TARGET_DEADBAND_W: f64 = 5.0;
-/// Allowed voltage range for MED's frequency table (338-398MHz). Steps
-/// never go outside this range regardless of how far off-target power
-/// reads.
-const POWER_TARGET_MIN_MV: i32 = 3496;
-const POWER_TARGET_MAX_MV: i32 = 3800;
 /// Voltage value to avoid landing on exactly (causes core-domain
 /// migration collapse). A step that would land here takes one further
 /// step in the same direction instead.
 const POWER_TARGET_AVOID_MV: i32 = 3600;
-/// Hard safety trip, independent of the configured target: step down
-/// immediately, ignoring hysteresis/interval, if power ever reads above
-/// this, short of the device's 133W hard ceiling.
-const POWER_TARGET_SAFETY_W: f64 = 120.0;
 /// How often this loop is allowed to change voltage -- gated past the
 /// SmartSpeed accumulation window (~131.1s, see toast.c's
 /// read_asic_spdlog()) so each step gets a chance to settle before being
@@ -323,7 +479,10 @@ fn gp_bits_mask_to_raw(gp_mask: GeneralPurposeBits) -> u32 {
 /// `[d,c,b,a, h,g,f,e, ...]`, word positions unchanged. `bytes.len()`
 /// must be a multiple of 4.
 fn word_bswap32(bytes: &[u8]) -> Vec<u8> {
-    bytes.chunks_exact(4).flat_map(|w| w.iter().rev().copied()).collect()
+    bytes
+        .chunks_exact(4)
+        .flat_map(|w| w.iter().rev().copied())
+        .collect()
 }
 
 /// Header layout offset for the merkle root field, matching the wire
@@ -421,7 +580,11 @@ struct JobContext {
 /// transaction, but `sha256d` doesn't care.
 fn compute_merkle_root_for_nonce2(ctx: &JobContext, nonce2: u32) -> bitcoin::TxMerkleNode {
     let mut coinbase = Vec::with_capacity(
-        ctx.coinbase1.len() + ctx.extranonce1.len() + NONCE2_SIZE as usize + 4 + ctx.coinbase2.len(),
+        ctx.coinbase1.len()
+            + ctx.extranonce1.len()
+            + NONCE2_SIZE as usize
+            + 4
+            + ctx.coinbase2.len(),
     );
     coinbase.extend_from_slice(&ctx.coinbase1);
     coinbase.extend_from_slice(&ctx.extranonce1);
@@ -653,7 +816,12 @@ impl HashThread for Nano3sHashThread {
 /// `word_bswap32()` (each 4-byte word reversed in place) to recover the
 /// raw wire byte order the chip's register-loading expects. `ntime` and
 /// `bits` are written big-endian.
-fn build_header_bytes(version: bitcoin::block::Version, prev_blockhash: bitcoin::BlockHash, ntime: u32, bits: bitcoin::pow::CompactTarget) -> [u8; 128] {
+fn build_header_bytes(
+    version: bitcoin::block::Version,
+    prev_blockhash: bitcoin::BlockHash,
+    ntime: u32,
+    bits: bitcoin::pow::CompactTarget,
+) -> [u8; 128] {
     let mut header = [0u8; 128];
     header[0..4].copy_from_slice(&(version.to_consensus() as u32).to_le_bytes());
     header[4..36].copy_from_slice(&word_bswap32(&prev_blockhash.to_byte_array()));
@@ -685,7 +853,11 @@ fn target_bytes_for(share_target: bitcoin::pow::Target) -> [u8; 32] {
     target
 }
 
-fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Result<Option<JobContext>> {
+fn send_task_to_chain(
+    job_id: u32,
+    task: &HashTask,
+    work_restart: bool,
+) -> Result<Option<JobContext>> {
     let template = task.template.as_ref();
     let mrt: &MerkleRootTemplate = match &template.merkle_root {
         MerkleRootKind::Computed(mrt) => mrt,
@@ -723,7 +895,9 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
     // convention. rtos_core.elf's miner_gen_nonce2_work() overwrites these
     // bytes on every task_send_work() call using its own internal nonce2
     // counter, so this initial value only matters for the first send.
-    let mut coinbase = Vec::with_capacity(coinbase1.len() + extranonce1.len() + NONCE2_SIZE as usize + 4 + coinbase2.len());
+    let mut coinbase = Vec::with_capacity(
+        coinbase1.len() + extranonce1.len() + NONCE2_SIZE as usize + 4 + coinbase2.len(),
+    );
     coinbase.extend_from_slice(&coinbase1);
     coinbase.extend_from_slice(&extranonce1);
     coinbase.extend_from_slice(&nonce2_start.to_le_bytes());
@@ -732,14 +906,21 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
 
     let nmerkles = mrt.merkle_branches.len();
     if nmerkles > 30 {
-        anyhow::bail!("nano3s: job has {nmerkles} merkle branches, hardware wire format supports at most 30");
+        anyhow::bail!(
+            "nano3s: job has {nmerkles} merkle branches, hardware wire format supports at most 30"
+        );
     }
     let mut merkles_flat = vec![0u8; nmerkles * 32];
     for (i, branch) in mrt.merkle_branches.iter().enumerate() {
         merkles_flat[i * 32..(i + 1) * 32].copy_from_slice(branch.as_byte_array());
     }
 
-    let header = build_header_bytes(template.version.base(), template.prev_blockhash, task.ntime, template.bits);
+    let header = build_header_bytes(
+        template.version.base(),
+        template.prev_blockhash,
+        task.ntime,
+        template.bits,
+    );
     // `template.share_target` is the current pool session target (Layer
     // 3), not the scheduler's flood-control target (Layer 2). No floor is
     // applied.
@@ -799,7 +980,13 @@ const POWER_I2C_ADDR: u32 = 0x40;
 
 fn i2c_read_word(bus: u32, addr: u32, reg: u32) -> Option<u32> {
     let output = std::process::Command::new("i2cget")
-        .args(["-y", &bus.to_string(), &format!("0x{addr:02x}"), &format!("0x{reg:02x}"), "w"])
+        .args([
+            "-y",
+            &bus.to_string(),
+            &format!("0x{addr:02x}"),
+            &format!("0x{reg:02x}"),
+            "w",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -862,7 +1049,13 @@ fn read_fan_status() -> Option<Fan> {
             continue;
         };
         match key {
-            "rpm" => rpm = val.parse::<i32>().ok().filter(|v| *v >= 0).map(|v| v as u32),
+            "rpm" => {
+                rpm = val
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|v| *v >= 0)
+                    .map(|v| v as u32)
+            }
             "duty" => percent = val.parse::<u8>().ok(),
             _ => {}
         }
@@ -973,6 +1166,13 @@ mod led_color {
     pub const FAULT: (u8, u8, u8) = (60, 0, 0); // dim red
 }
 
+/// The Domino/Vegas effects' shared gold -- deliberately warm (more red
+/// than green, no blue) to match the live UI's gold domino ripple.
+const LED_DOMINO_GOLD: (u8, u8, u8) = (255, 191, 0);
+/// The occasional white-hot bulb in the Vegas effect (a slightly cool
+/// white, so it pops against LED_DOMINO_GOLD).
+const LED_VEGAS_WHITE: (u8, u8, u8) = (235, 245, 255);
+
 struct Ws2812Strip {
     file: Option<std::fs::File>,
     last: Option<[(u8, u8, u8); WS2812_LED_COUNT]>,
@@ -1051,6 +1251,15 @@ enum LedEffect {
     /// jitters brightness and hue within a red/orange/amber range.
     /// Ignores `color` -- always warm.
     FireFlicker,
+    /// A gold pulse steps LED by LED down the strip like falling dominoes
+    /// (with a decaying tail behind the head), timed to read in sync with
+    /// the LCD's domino ripple across its 12 ASIC tiles. Ignores `color`
+    /// -- always gold, to match the live UI.
+    Domino,
+    /// Vegas-style random gold/white sparkles that pop, decay, and
+    /// relight -- pairs with the live UI's Vegas flicker on the ASIC
+    /// tiles. Ignores `color` -- always gold.
+    Vegas,
 }
 
 impl LedEffect {
@@ -1068,6 +1277,8 @@ impl LedEffect {
             LedEffect::Scanner => "scanner",
             LedEffect::Twinkle => "twinkle",
             LedEffect::FireFlicker => "fire_flicker",
+            LedEffect::Domino => "domino",
+            LedEffect::Vegas => "vegas",
         }
     }
 
@@ -1085,8 +1296,10 @@ impl LedEffect {
             "scanner" => Ok(LedEffect::Scanner),
             "twinkle" => Ok(LedEffect::Twinkle),
             "fire_flicker" => Ok(LedEffect::FireFlicker),
+            "domino" => Ok(LedEffect::Domino),
+            "vegas" => Ok(LedEffect::Vegas),
             other => Err(format!(
-                "unknown LED effect '{other}' (want auto/off/solid/rainbow/colorloop/breathe/blink/chase/chase_rainbow/scanner/twinkle/fire_flicker)"
+                "unknown LED effect '{other}' (want auto/off/solid/rainbow/colorloop/breathe/blink/chase/chase_rainbow/scanner/twinkle/fire_flicker/domino/vegas)"
             )),
         }
     }
@@ -1116,7 +1329,10 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     if s.len() != 6 {
         return Err(format!("invalid color '{s}' (want #RRGGBB)"));
     }
-    let byte = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("invalid color '{s}' (want #RRGGBB)"));
+    let byte = |i: usize| {
+        u8::from_str_radix(&s[i..i + 2], 16)
+            .map_err(|_| format!("invalid color '{s}' (want #RRGGBB)"))
+    };
     Ok((byte(0)?, byte(2)?, byte(4)?))
 }
 
@@ -1125,7 +1341,12 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
 /// semantics. Any argument left `None` keeps that field's current value.
 /// Returns an error string (for the handler to turn into a 400) on an
 /// unknown effect name or malformed color.
-pub(crate) fn write_led_command(effect: Option<String>, color: Option<String>, brightness: Option<u8>, speed: Option<u8>) -> Result<(), String> {
+pub(crate) fn write_led_command(
+    effect: Option<String>,
+    color: Option<String>,
+    brightness: Option<u8>,
+    speed: Option<u8>,
+) -> Result<(), String> {
     let mut state = LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = effect {
         state.effect = LedEffect::parse(&e)?;
@@ -1147,7 +1368,10 @@ pub(crate) fn get_led_state() -> crate::api_client::types::BoardLedState {
     let state = *LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
     crate::api_client::types::BoardLedState {
         effect: state.effect.as_str().to_string(),
-        color: format!("#{:02x}{:02x}{:02x}", state.color.0, state.color.1, state.color.2),
+        color: format!(
+            "#{:02x}{:02x}{:02x}",
+            state.color.0, state.color.1, state.color.2
+        ),
         brightness: state.brightness,
         speed: state.speed,
     }
@@ -1168,7 +1392,11 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    (((r1 + m) * 255.0).round() as u8, ((g1 + m) * 255.0).round() as u8, ((b1 + m) * 255.0).round() as u8)
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
 }
 
 /// Degrees the rainbow-chase phase advances per ~200ms tick at
@@ -1198,7 +1426,11 @@ fn rainbow_frame(phase_deg: f32, brightness: u8) -> [(u8, u8, u8); WS2812_LED_CO
 /// dim/pulse a fixed user color rather than working in HSV.
 fn scale_color(rgb: (u8, u8, u8), level: f32) -> (u8, u8, u8) {
     let level = level.clamp(0.0, 1.0);
-    ((rgb.0 as f32 * level).round() as u8, (rgb.1 as f32 * level).round() as u8, (rgb.2 as f32 * level).round() as u8)
+    (
+        (rgb.0 as f32 * level).round() as u8,
+        (rgb.1 as f32 * level).round() as u8,
+        (rgb.2 as f32 * level).round() as u8,
+    )
 }
 
 /// Tiny xorshift32 PRNG for Twinkle/FireFlicker's per-pixel randomness --
@@ -1232,12 +1464,22 @@ struct AnimState {
     blink_accum: f32,
     twinkle: [f32; WS2812_LED_COUNT],
     fire: [f32; WS2812_LED_COUNT],
+    /// Domino effect's integer head position (steps one LED per tick,
+    /// wrapping -- 200ms/LED gives the whole strip a clean 1.8s sweep).
+    domino_pos: usize,
+    /// Vegas sparkle intensity per LED (same decay pattern as twinkle,
+    /// but always gold -- see LedEffect::Vegas).
+    vegas: [f32; WS2812_LED_COUNT],
     rng: u32,
 }
 
 impl AnimState {
     fn new() -> Self {
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0).max(1);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            .max(1);
         Self {
             effect: LedEffect::Auto,
             phase_deg: 0.0,
@@ -1248,6 +1490,8 @@ impl AnimState {
             blink_accum: 0.0,
             twinkle: [0.0; WS2812_LED_COUNT],
             fire: [0.6; WS2812_LED_COUNT],
+            domino_pos: 0,
+            vegas: [0.0; WS2812_LED_COUNT],
             rng: seed,
         }
     }
@@ -1264,6 +1508,8 @@ impl AnimState {
             self.blink_on = true;
             self.blink_accum = 0.0;
             self.twinkle = [0.0; WS2812_LED_COUNT];
+            self.domino_pos = 0;
+            self.vegas = [0.0; WS2812_LED_COUNT];
         }
     }
 
@@ -1300,7 +1546,8 @@ impl AnimState {
                 [scale_color(ov.color, level); WS2812_LED_COUNT]
             }
             LedEffect::Chase => {
-                self.chase_pos = (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
+                self.chase_pos =
+                    (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 let pos = self.chase_pos as i32;
                 for (i, c) in colors.iter_mut().enumerate() {
@@ -1311,7 +1558,8 @@ impl AnimState {
                 colors
             }
             LedEffect::ChaseRainbow => {
-                self.chase_pos = (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
+                self.chase_pos =
+                    (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
                 self.phase_deg = (self.phase_deg + 3.0 + speed_frac * 6.0) % 360.0;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 let pos = self.chase_pos as i32;
@@ -1375,6 +1623,57 @@ impl AnimState {
                 colors
             }
             LedEffect::Auto | LedEffect::Off | LedEffect::Solid => [(0, 0, 0); WS2812_LED_COUNT],
+            LedEffect::Domino => {
+                // One gold head steps LED-by-LED down the strip; the two
+                // LEDs behind it hold a decaying tail so the sweep reads
+                // as a pulse traveling through falling dominoes. A full
+                // strip sweep takes WS2812_LED_COUNT ticks (1.8s at the
+                // 200ms worker cadence) -- matched to the live UI's
+                // domino ripple across its 12 ASIC tiles so the panel and
+                // strip read as one effect.
+                let head = self.domino_pos;
+                self.domino_pos = (self.domino_pos + 1) % WS2812_LED_COUNT;
+                let v = ov.brightness as f32 / 255.0;
+                let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
+                for (i, c) in colors.iter_mut().enumerate() {
+                    let level = match head.abs_diff(i) {
+                        0 => 1.0,
+                        1 => 0.45,
+                        2 => 0.18,
+                        _ => 0.0,
+                    };
+                    *c = scale_color(LED_DOMINO_GOLD, v * level);
+                }
+                colors
+            }
+            LedEffect::Vegas => {
+                // Random gold/white sparkles that pop, decay, and relight
+                // -- the strip-side twin of the live UI's Vegas flicker on
+                // its ASIC tiles. Spawn chance scales with speed, like
+                // Twinkle.
+                let spawn_chance = 0.02 + speed_frac * 0.2;
+                for t in self.vegas.iter_mut() {
+                    if *t <= 0.01 && rand_unit(&mut self.rng) < spawn_chance {
+                        *t = 1.0;
+                    } else {
+                        *t *= 0.80;
+                    }
+                }
+                let v = ov.brightness as f32 / 255.0;
+                let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
+                for (i, c) in colors.iter_mut().enumerate() {
+                    // ~1 in 6 sparks reads white-hot instead of pure gold,
+                    // like a marquee bulb running brighter than its
+                    // neighbors.
+                    let color = if rand_unit(&mut self.rng) < 0.16 {
+                        LED_VEGAS_WHITE
+                    } else {
+                        LED_DOMINO_GOLD
+                    };
+                    *c = scale_color(color, v * self.vegas[i]);
+                }
+                colors
+            }
         }
     }
 }
@@ -1385,7 +1684,16 @@ impl AnimState {
 const NANO3S_LIVE_FILE: &str = "/tmp/nano3s_live.txt";
 
 #[allow(clippy::too_many_arguments)]
-fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u32, is_idle: bool, st: &Nano3sStatus, power_w: f64, difficulty: f64) {
+fn write_live_status(
+    ipc_ok: bool,
+    current_job_id: Option<u32>,
+    shares_found: u32,
+    is_idle: bool,
+    st: &Nano3sStatus,
+    power_w: f64,
+    difficulty: f64,
+    power_mode: PowerMode,
+) {
     let job_id_str = match current_job_id {
         Some(id) => format!("{id:016x}"),
         None => "-".to_string(),
@@ -1407,7 +1715,9 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
          pll2={pll2}\n\
          pll3={pll3}\n\
          err_crc={err_crc}\n\
-         voltage_mv={voltage_mv}\n",
+         voltage_mv={voltage_mv}\n\
+         mode={mode}\
+{chip_lines}",
         ipc = if ipc_ok { 1 } else { 0 },
         paused = if is_idle { 1 } else { 0 },
         asics_total = st.asics_total,
@@ -1420,6 +1730,27 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
         pll3 = st.pll_freq[3],
         err_crc = st.err_crc,
         voltage_mv = st.voltage_mv,
+        // For the live UI's 12-ASIC health grid -- temp drives the tile's
+        // color/Vegas flicker, ghsspd/spd_dh drive its per-chip hashrate
+        // + fail-rate readouts. The UI derives health itself: a chip is
+        // healthy when it's reporting nonces and its fail rate stays
+        // under 50%. Slots beyond chip_count are never emitted, and the
+        // UI treats a missing chipN line as an offline tile.
+        mode = power_mode.as_str(),
+        chip_lines = (0..st.chip_count as usize)
+            .filter(|&i| i < NANO3S_STATUS_MAX_CHIPS)
+            .map(|i| {
+                let c = &st.chips[i];
+                format!(
+                    "\nchip{i}={temp:.1},{ghs:.1},{dh:.1},{hb},{nd}",
+                    temp = c.temp_c,
+                    ghs = c.ghsspd,
+                    dh = c.spd_dh,
+                    hb = c.nonce_heartbeat,
+                    nd = c.nonce_data
+                )
+            })
+            .collect::<String>(),
     );
     if let Err(e) = std::fs::write(NANO3S_LIVE_FILE, body) {
         eprintln!("[nano3s] failed to write {NANO3S_LIVE_FILE}: {e}");
@@ -1450,6 +1781,12 @@ fn run_worker(
     // except Auto/Off/Solid); persists across ticks.
     let mut anim = AnimState::new();
 
+    // Operating mode (stock/oc/bypass) -- loaded from POWER_MODE_FILE so
+    // the selected restraints survive reboots, live-switchable via a
+    // `mode:<name>` MUJINA_CONTROL_FILE command (see the match arm below
+    // and `write_power_mode_command()`/`PATCH /api/v0/boards/{name}/power-mode`).
+    let mut power_mode = load_power_mode();
+
     let rc = unsafe { nano3s_ipc_open() };
     let ipc_ok = rc == 0;
     if !ipc_ok {
@@ -1459,17 +1796,22 @@ fn run_worker(
         // hang waiting on responses, but nothing will ever hash.
     } else {
         // Ramp the chain up from its ~100MHz cold bring-up default via
-        // IPC_MSG_SET_MODE. Fire-and-forget -- rtos_core applies the
-        // gradual ramp on its own worker thread.
-        let rc = unsafe { nano3s_ipc_set_mode(NANO3S_PLL_FREQ_TARGET.as_ptr(), 0) };
+        // IPC_MSG_SET_MODE to the active mode's target. Fire-and-forget
+        // -- rtos_core applies the gradual ramp on its own worker thread.
+        let ramp_target = power_mode.ramp_target();
+        let rc = unsafe { nano3s_ipc_set_mode(ramp_target.as_ptr(), 0) };
         if rc != 0 {
-            eprintln!("[nano3s] nano3s_ipc_set_mode failed -- chain will stay at cold bring-up clock");
+            eprintln!(
+                "[nano3s] nano3s_ipc_set_mode failed -- chain will stay at cold bring-up clock"
+            );
         }
 
         // Declare a known-good estimate immediately rather than leaving
         // this at the trait's zero default. Status updates below
         // supersede this once rtos_core.elf starts reporting.
-        let _ = event_tx.try_send(HashThreadEvent::ExpectedHashRate(HashRate::from_gigahashes(NANO3S_EXPECTED_HASHRATE_GHS)));
+        let _ = event_tx.try_send(HashThreadEvent::ExpectedHashRate(
+            HashRate::from_gigahashes(NANO3S_EXPECTED_HASHRATE_GHS),
+        ));
     }
 
     let job_id_counter = AtomicU32::new(1);
@@ -1505,7 +1847,7 @@ fn run_worker(
     // lands back at rtos_core's ~100MHz cold bring-up default. Track what
     // was actually last applied via a `tune:` command (defaulting to the
     // startup ramp target) and reapply both after every resume.
-    let mut last_applied_pll_freq: [u32; 4] = NANO3S_PLL_FREQ_TARGET;
+    let mut last_applied_pll_freq: [u32; 4] = power_mode.ramp_target();
     let mut last_applied_voltage_mv: Option<i32> = None;
 
     loop {
@@ -1529,7 +1871,9 @@ fn run_worker(
                 // Fire-and-forget, same as the initial startup ramp.
                 let rc = unsafe { nano3s_ipc_set_mode(last_applied_pll_freq.as_ptr(), 0) };
                 if rc != 0 {
-                    eprintln!("[nano3s] post-resume nano3s_ipc_set_mode failed -- chain may stay at cold bring-up clock");
+                    eprintln!(
+                        "[nano3s] post-resume nano3s_ipc_set_mode failed -- chain may stay at cold bring-up clock"
+                    );
                 }
                 if let Some(mv) = last_applied_voltage_mv {
                     let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
@@ -1539,7 +1883,48 @@ fn run_worker(
                 }
                 is_idle = false;
                 manual_pause = false;
-                eprintln!("[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})");
+                eprintln!(
+                    "[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})"
+                );
+            }
+            Some(s) if s.starts_with("mode:") => {
+                // Power-mode switch (see PowerMode's doc comment for what
+                // each mode does). Persisted immediately so the choice
+                // survives a reboot, then applied live: re-ramp to the
+                // mode's PLL target and clamp the latched voltage into
+                // the new mode's range (stock/oc can't keep a bypass-era
+                // 4000mV latch; bypass keeps whatever was running).
+                match PowerMode::parse(&s["mode:".len()..]) {
+                    Some(new_mode) => {
+                        power_mode = new_mode;
+                        save_power_mode(new_mode);
+                        eprintln!(
+                            "[nano3s] power mode: {} (re-ramping + clamping voltage)",
+                            new_mode.as_str()
+                        );
+                        let ramp_target = new_mode.ramp_target();
+                        let rc = unsafe { nano3s_ipc_set_mode(ramp_target.as_ptr(), 0) };
+                        if rc != 0 {
+                            eprintln!("[nano3s] power mode: nano3s_ipc_set_mode failed");
+                        }
+                        last_applied_pll_freq = ramp_target;
+                        let (vmin, vmax) = new_mode.voltage_range_mv();
+                        if let Some(mv) = last_applied_voltage_mv {
+                            let clamped = mv.clamp(vmin, vmax);
+                            if clamped != mv {
+                                eprintln!(
+                                    "[nano3s] power mode: latched voltage {mv}mV clamped to {clamped}mV"
+                                );
+                            }
+                            let rc = unsafe { nano3s_ipc_set_voltage_raw(clamped) };
+                            if rc != 0 {
+                                eprintln!("[nano3s] power mode: nano3s_ipc_set_voltage_raw failed");
+                            }
+                            last_applied_voltage_mv = Some(clamped);
+                        }
+                    }
+                    None => eprintln!("[nano3s] malformed mode directive: {s}"),
+                }
             }
             Some(s) if s.starts_with("tune:") => {
                 // See write_tuning_command()'s doc comment for the exact
@@ -1549,14 +1934,20 @@ fn run_worker(
                     eprintln!("[nano3s] malformed tune directive (want 6 fields): {s}");
                 } else {
                     if !fields[0].is_empty() {
-                        match fields[0..4].iter().map(|f| f.parse::<u32>()).collect::<Result<Vec<u32>, _>>() {
+                        match fields[0..4]
+                            .iter()
+                            .map(|f| f.parse::<u32>())
+                            .collect::<Result<Vec<u32>, _>>()
+                        {
                             Ok(freq) => {
                                 let rc = unsafe { nano3s_ipc_set_mode(freq.as_ptr(), 0) };
                                 if rc != 0 {
                                     eprintln!("[nano3s] tuning: nano3s_ipc_set_mode failed");
                                 } else {
                                     last_applied_pll_freq = [freq[0], freq[1], freq[2], freq[3]];
-                                    eprintln!("[nano3s] tuning: SET_MODE pll_freq={freq:?} (via dashboard/API)");
+                                    eprintln!(
+                                        "[nano3s] tuning: SET_MODE pll_freq={freq:?} (via dashboard/API)"
+                                    );
                                 }
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune frequency fields: {s}"),
@@ -1570,7 +1961,9 @@ fn run_worker(
                                     eprintln!("[nano3s] tuning: nano3s_ipc_set_voltage_raw failed");
                                 } else {
                                     last_applied_voltage_mv = Some(mv);
-                                    eprintln!("[nano3s] tuning: SET_VOLTAGE_RAW target_mv={mv} (via dashboard/API)");
+                                    eprintln!(
+                                        "[nano3s] tuning: SET_VOLTAGE_RAW target_mv={mv} (via dashboard/API)"
+                                    );
                                 }
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune voltage field: {s}"),
@@ -1581,7 +1974,9 @@ fn run_worker(
                             Ok(w) => {
                                 power_target_w = Some(w);
                                 next_power_check = std::time::Instant::now();
-                                eprintln!("[nano3s] tuning: power-target set to {w:.1}W (via dashboard/API)");
+                                eprintln!(
+                                    "[nano3s] tuning: power-target set to {w:.1}W (via dashboard/API)"
+                                );
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune power-target field: {s}"),
                         }
@@ -1600,7 +1995,9 @@ fn run_worker(
                             // Act on the new target at the next check
                             // rather than waiting out the old interval.
                             next_power_check = std::time::Instant::now();
-                            eprintln!("[nano3s] power-target: live target set to {w:.1}W via dashboard/API");
+                            eprintln!(
+                                "[nano3s] power-target: live target set to {w:.1}W via dashboard/API"
+                            );
                         }
                         Err(_) => eprintln!("[nano3s] malformed power_target directive: {s}"),
                     }
@@ -1612,7 +2009,11 @@ fn run_worker(
         // Drain pending commands (non-blocking).
         loop {
             match cmd_rx.try_recv() {
-                Ok(WorkerCommand::UpdateTask { task, replace, response_tx }) => {
+                Ok(WorkerCommand::UpdateTask {
+                    task,
+                    replace,
+                    response_tx,
+                }) => {
                     if manual_pause {
                         // Stay idle -- remember the latest task to apply
                         // once a "resume" arrives. Do not touch RST/UART
@@ -1689,8 +2090,13 @@ fn run_worker(
                 None => {
                     eprintln!(
                         "[nano3s] DIAG nonce for unknown job_id=0x{:08x} nonce2=0x{:08x} nonce=0x{:08x} mid_id={} (known job_ids: {:?})",
-                        nonce.job_id, nonce.nonce2, nonce.nonce, nonce.mid_id,
-                        jobs.keys().map(|k| format!("0x{k:08x}")).collect::<Vec<_>>()
+                        nonce.job_id,
+                        nonce.nonce2,
+                        nonce.nonce,
+                        nonce.mid_id,
+                        jobs.keys()
+                            .map(|k| format!("0x{k:08x}"))
+                            .collect::<Vec<_>>()
                     );
                 }
                 Some(ctx) => {
@@ -1707,7 +2113,11 @@ fn run_worker(
         if unsafe { nano3s_ipc_get_status(&mut st as *mut _) } == 1 {
             let mut s = status.lock().unwrap();
             s.hashrate = HashRate::from_gigahashes(st.ghsmm as f64);
-            s.temperature_c = if st.temp_avg > 0.0 { Some(st.temp_avg) } else { None };
+            s.temperature_c = if st.temp_avg > 0.0 {
+                Some(st.temp_avg)
+            } else {
+                None
+            };
             s.is_active = current_task.is_some() && st.paused == 0;
             drop(s);
 
@@ -1717,7 +2127,11 @@ fn run_worker(
             // shares-based statistical estimator.
             let _ = event_tx.try_send(HashThreadEvent::StatusUpdate(HashThreadStatus {
                 hashrate: HashRate::from_gigahashes(st.ghsmm as f64),
-                temperature_c: if st.temp_avg > 0.0 { Some(st.temp_avg) } else { None },
+                temperature_c: if st.temp_avg > 0.0 {
+                    Some(st.temp_avg)
+                } else {
+                    None
+                },
                 is_active: current_task.is_some() && st.paused == 0,
                 ..Default::default()
             }));
@@ -1733,7 +2147,12 @@ fn run_worker(
                 let cur_mv = st.voltage_mv as i32;
                 let now = std::time::Instant::now();
 
-                let step = if power_w > POWER_TARGET_SAFETY_W {
+                // The active mode's hard safety trip (None in bypass --
+                // that's the whole point of the mode).
+                let step = if power_mode
+                    .safety_trip_w()
+                    .is_some_and(|trip| power_w > trip)
+                {
                     // Hard safety trip -- always allowed, ignores the
                     // interval gate.
                     Some(-POWER_TARGET_STEP_MV)
@@ -1754,7 +2173,8 @@ fn run_worker(
                     if new_mv == POWER_TARGET_AVOID_MV {
                         new_mv += step;
                     }
-                    new_mv = new_mv.clamp(POWER_TARGET_MIN_MV, POWER_TARGET_MAX_MV);
+                    let (vmin, vmax) = power_mode.voltage_range_mv();
+                    new_mv = new_mv.clamp(vmin, vmax);
 
                     if new_mv != cur_mv {
                         eprintln!(
@@ -1855,7 +2275,16 @@ fn run_worker(
                 *d = Some(detail);
             }
         }
-        write_live_status(ipc_ok, current_job_id, shares_found, is_idle, &st, last_power_w, current_difficulty);
+        write_live_status(
+            ipc_ok,
+            current_job_id,
+            shares_found,
+            is_idle,
+            &st,
+            last_power_w,
+            current_difficulty,
+            power_mode,
+        );
 
         {
             let ov = *LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1873,7 +2302,9 @@ fn run_worker(
                     });
                 }
                 LedEffect::Off => led.off(),
-                LedEffect::Solid => led.set_all(scale_color(ov.color, ov.brightness as f32 / 255.0)),
+                LedEffect::Solid => {
+                    led.set_all(scale_color(ov.color, ov.brightness as f32 / 255.0))
+                }
                 _ => led.set(anim.frame(ov)),
             }
         }

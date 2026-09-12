@@ -124,6 +124,51 @@ The rest of this section covers building both firmwares yourself and
 deploying over SSH -- useful for development, or if you want to modify
 the firmware before flashing.
 
+#### Custom Boot Logo
+
+The device shows a boot logo on the LCD for the first ~5 seconds after
+power-on, then hands the screen to the live mining UI. To use your own
+logo:
+
+```bash
+python3 tools/make_bootlogo.py path/to/your-logo.png
+# -> writes tools/bootlogo.rgb565 (240x240 RGB565, panel-native)
+```
+
+Any image format Pillow reads works; transparency is composited onto
+black (the UI's background color) and the artwork is letterboxed to
+the square panel. `deploy_stock_to_nano3s.sh` pushes
+`tools/bootlogo.rgb565` to `/mntapp/release/linux/app/bootlogo.rgb565`
+automatically when present; without it the device simply boots to the
+live UI with no logo hold.
+
+#### Build a Flashable Image (no Linux box needed)
+
+Turn a released base image plus this repo's built firmware into a
+flashable `.kdimg`, with the boot logo, pool settings and a wiped
+`/data` (first-time BLE setup) baked in:
+
+```bash
+tools/build_kdimg.sh \
+  --base ~/Downloads/nano-mujina-alpha-v2.kdimg \
+  --out ~/Downloads/nano-mujina-custom.kdimg \
+  --pool stratum+tcp://yourpool:3333 --user YOURWALLET.worker
+```
+
+Everything runs natively on macOS/Windows/Linux Python except the
+UBIFS rebuild, which uses any container runtime (`docker`, `colima`,
+`podman` via `DOCKER=podman`). `tools/kdimg.py` can also inspect,
+verify and extract released images on its own.
+
+#### GUI Flasher (macOS)
+
+Double-click `tools/nano_flasher.command` (first run self-installs its
+environment, about a minute). The flasher pops up when a Nano3s in
+burn mode is plugged in, parses and sha256-verifies the chosen image,
+and flashes it over USB with live progress; drag-and-drop a `.kdimg`
+onto the window to select it. Uses the same `k230-flash` library as
+the CLI, so a `brew install libusb` covers both.
+
 ### 1. Get the cross-toolchains
 
 Two separate toolchains are needed, one per core:

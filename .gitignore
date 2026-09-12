@@ -1,3 +1,23 @@
 Cargo.lock
 /target/
 /.cache/
+
+# kdimg pipeline work directory (build_kdimg.sh)
+/build/
+
+# rust/cargo build outputs + host cargo cache
+mujina-miner/target/
+nano3s_ui/target/
+rtos_core/build/
+.cargo-home/
+__pycache__/
+
+# vendored SDK blobs -- regenerate with rtos_core/tools/install_sdk.sh
+rtos_core/vendor/
+
+# macOS cruft
+.DS_Store
+
+# Generated boot logo (binary asset -- regenerate from source art with
+# tools/make_bootlogo.py, see README's Custom Boot Logo section)
+tools/bootlogo.rgb565
