@@ -10,6 +10,7 @@ pub mod env_help;
 pub mod hw_trait;
 pub mod job_source;
 pub mod mgmt_protocol;
+pub mod miner_settings;
 pub mod peripheral;
 pub mod scheduler;
 pub mod stratum_v1;

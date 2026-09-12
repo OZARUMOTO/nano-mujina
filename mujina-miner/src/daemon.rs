@@ -111,18 +111,60 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        // Controlled by environment variables:
-        // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        // Pool/identity config resolution, in precedence order:
+        //   1. persisted dashboard settings file (see miner_settings) -- the
+        //      GLOBAL SETTINGS modal's write path; lets the pool be changed
+        //      on-device without a reflash
+        //   2. MUJINA_POOL_URL / MUJINA_POOL_USER / MUJINA_POOL_PASS env vars
+        //      (what tools/build_kdimg.sh --pool/--user bake into the startup
+        //      script)
+        // Read ONCE here: pool/identity are startup-time config. Changes take
+        // effect at next daemon start -- POST /restart kills this process and
+        // the startup script's supervisor loop relaunches it with the new
+        // file contents.
+        let settings = crate::miner_settings::MinerSettings::load();
+        let pool_from_settings = settings.as_ref().and_then(|s| s.pool.clone());
+        if let Some(p) = &pool_from_settings {
+            info!(
+                "minersettings: using persisted pool config from {} ({})",
+                crate::miner_settings::SETTINGS_PATH,
+                p
+            );
+        }
+
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
+        let pool_url = pool_from_settings
+            .as_ref()
+            .map(|p| p.url.clone())
+            .or_else(|| env::var("MUJINA_POOL_URL").ok());
+
+        if let Some(pool_url) = pool_url {
             // Use Stratum v1 source
-            let pool_user =
-                env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
+            let mut pool_user = pool_from_settings
+                .as_ref()
+                .map(|p| p.user.clone())
+                .or_else(|| env::var("MUJINA_POOL_USER").ok())
+                .unwrap_or_else(|| "mujina-testing".to_string());
+            let pool_pass = pool_from_settings
+                .as_ref()
+                .and_then(|p| p.password.clone())
+                .or_else(|| env::var("MUJINA_POOL_PASS").ok())
+                .unwrap_or_else(|| "x".to_string());
+
+            // Miner name (settings file only -- the modal's IDENTITY field)
+            // becomes the worker suffix, mirroring the dashboard's own
+            // preview: skipped when the user field already ends with it.
+            if let Some(name) = settings.as_ref().and_then(|s| s.name.clone()) {
+                if !name.is_empty()
+                    && !pool_user
+                        .to_lowercase()
+                        .ends_with(&format!(".{}", name.to_lowercase()))
+                {
+                    pool_user = format!("{pool_user}.{name}");
+                }
+            }
 
             let stratum_config = StratumPoolConfig {
                 url: pool_url.clone(),

@@ -558,7 +558,7 @@
       <div class="note" id="workernote" style="margin:-6px 0 4px"></div>
 
       <div class="modalsec">Apply</div>
-      <div class="note" id="restartnote">The daemon reads its name and pool once, at startup.</div>
+      <div class="note" id="restartnote">Name and pool are read once at startup. Applying them reboots the device (~1–2 min) — same as stock firmware.</div>
       <div class="acts" style="margin-top:0">
         <button class="btn pri" id="mrestart">Restart Mujina Now</button>
       </div>
@@ -1497,8 +1497,8 @@ async function launchDoom() {
   }
 }
 async function restartMiner() {
-  if (!confirm('Restart Mujina now? Mining stops for a few seconds while both boards re-enumerate.')) return;
-  $('smsg').textContent = 'restarting — this takes ~15s…'; $('smsg').className = 'msg';
+  if (!confirm('Restart Mujina now? This REBOOTS the device (~1-2 min offline). Required to apply settings: the ASIC firmware link only comes up cleanly at boot.')) return;
+  $('smsg').textContent = 'rebooting — device returns in ~1-2 min, reload this page after'; $('smsg').className = 'msg';
   $('mrestart').disabled = true;
   try {
     const j = await post('/restart', {});

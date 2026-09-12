@@ -263,5 +263,5 @@ impl EmberOne00 {
 #[cfg(test)]
 mod tests {}
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", feature = "emberone00-hil"))]
 mod integration_tests;

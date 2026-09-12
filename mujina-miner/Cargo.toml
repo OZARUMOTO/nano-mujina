@@ -100,6 +100,11 @@ usb-udev = ["dep:udev"]
 # build would fail to link. Only pass --features nano3s when
 # cross-compiling for riscv64gc-unknown-linux-gnu for the actual device.
 nano3s = []
+# emberOne00 hardware-in-the-loop integration tests (board/emberone00/
+# integration_tests.rs): need a physical board attached via USB on a Linux
+# host. Opt-in so container/CI/`--no-default-features` builds (which lack
+# the udev dependency entirely) can compile and run the rest of the suite.
+emberone00-hil = []
 
 [build-dependencies]
 cc = "1"

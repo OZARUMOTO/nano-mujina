@@ -305,6 +305,26 @@ is healthy; near-100% right after boot just means voltage is still ramping),
     at mid-80s °C at the 133 W OC target with auto fan. The numbers to watch
     over time: `err_crc` (flat = good), fail rate (single digits), and whether
     temps *trend* upward day over day.
+11. **The RTOS IPC link does not survive a daemon restart.** If
+    `mujina-minerd` is killed (crash, manual `killall`, daemon-only
+    "restart"), the next instance starts but its IPC connect to
+    `rtos_core` blocks forever: hashrate `--`, no pool connect, nothing
+    mines — until a full device reboot. Stock firmware behaves the same
+    way, which is why applying settings there reboots the device. Our
+    `POST /restart` therefore reboots the device (detached
+    `sleep 1; reboot`), never just the daemon. Back up in ~90 s.
+12. **Right after boot, the fail rate reads ~97% and per-chip ghs ~0 —
+    that is the voltage ramp, not a fault.** The power controller walks
+    core voltage up toward the mode's target over several minutes; the
+    ASICs' SmartSpeed fails collapse to single digits once it settles
+    (auto fan keeps temps in check meanwhile). Judge health ~5 min after
+    boot, not at boot.
+13. **Pool/identity changes need no reflash anymore:** the dashboard's
+    GLOBAL SETTINGS modal (or `POST /minersettings`) writes
+    `/data/minersettings.json`, which the daemon reads at startup in
+    preference to the baked-in env. Applying = device reboot
+    (gotcha 11). Miner name becomes the pool worker suffix unless the
+    user field already ends with it.
 
 ---
 

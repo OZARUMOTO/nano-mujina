@@ -1,8 +1,10 @@
 //! Static dashboard UI plus a `/data` endpoint reshaping [`MinerTelemetry`]
 //! into the JSON shape the `mujina-dashboard` frontend expects.
 //!
-//! Serves `/dashboard` (the page) and `/data` (its polling endpoint).
-//! Read-only: no settings/tuning/autotune/restart endpoints. Fan/tuning
+//! Serves `/dashboard` (the page) and `/data` (its polling endpoint), plus
+//! the GLOBAL SETTINGS modal's backend: `GET`/`POST /minersettings` (the
+//! persisted miner identity + pool, see [`crate::miner_settings`]) and
+//! `POST /restart` (re-execs the daemon onto the saved settings). Fan/tuning
 //! control for this board goes through `mujina_test_harness.c`'s
 //! file-based mechanism instead.
 
@@ -85,6 +87,135 @@ pub fn routes() -> Router<SharedState> {
         .route("/nano3s-detail", routing::get(serve_nano3s_detail))
         .route("/mujina-head-mark.svg", routing::get(serve_logo_svg))
         .route("/doom/launch", routing::post(launch_doom))
+        .route(
+            "/minersettings",
+            routing::get(get_miner_settings).post(post_miner_settings),
+        )
+        .route("/restart", routing::post(restart_miner))
+}
+
+// ==================== GLOBAL SETTINGS modal backend ====================
+// assets/dashboard.html has always shipped the UI for these three
+// endpoints, but nothing implemented them: the POST 404'd, the browser
+// failed to parse the error page as JSON, and the modal surfaced
+// "SyntaxError: The string did not match the expected pattern".
+//
+// Contract (from the modal's own JS):
+//   GET /minersettings  -> settings JSON the modal renders (password is
+//                          never returned, only `password_set`)
+//   POST /minersettings -> body {name?, pool?{url,user,password?}};
+//                          response {ok, detail?, settings{...,
+//                          restart_required:true}}
+//   POST /restart       -> response {ok, detail?}; the daemon reads its
+//                          pool/identity ONCE at startup, so applying a
+//                          save means exiting -- deploy/
+//                          mujina_display_startup.sh's supervisor
+//                          relaunches mujina-minerd within seconds onto
+//                          /data/minersettings.json's new contents.
+
+/// `GET /minersettings` -- persisted settings, with the modal's URL/User
+/// fields falling back to the env vars the daemon was started with (what
+/// `build_kdimg.sh --pool/--user` bakes in), so the modal shows the
+/// values the miner is actually running with even before a first save.
+async fn get_miner_settings() -> Json<Value> {
+    let settings = crate::miner_settings::MinerSettings::load();
+    let sj = crate::miner_settings::response_settings_json(settings.as_ref());
+    Json(json!({
+        "ok": true,
+        "settings": sj,
+        "restart_required": false,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct PoolSettingsBody {
+    url: String,
+    user: String,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct MinerSettingsBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    pool: Option<PoolSettingsBody>,
+}
+
+/// `POST /minersettings` -- validate, persist atomically, and tell the
+/// modal to show its restart badge. A blank password field means
+/// "unchanged" (the modal only sends the key when non-empty); settings
+/// not present in the body keep their previous values.
+async fn post_miner_settings(Json(body): Json<MinerSettingsBody>) -> Json<Value> {
+    if let Some(p) = &body.pool {
+        if p.url.is_empty() || p.user.is_empty() {
+            return Json(json!({
+                "ok": false,
+                "detail": "pool URL and user are both required",
+            }));
+        }
+    }
+
+    let mut settings = crate::miner_settings::MinerSettings::load().unwrap_or_default();
+    settings.name = body.name.filter(|n| !n.trim().is_empty());
+    settings.pool = body.pool.map(|p| {
+        let password = p
+            .password
+            .filter(|s| !s.is_empty())
+            .or_else(|| settings.pool.as_ref().and_then(|old| old.password.clone()));
+        crate::miner_settings::PoolSettings {
+            url: p.url,
+            user: p.user,
+            password,
+        }
+    });
+
+    match settings.save() {
+        Ok(()) => {
+            let mut sj = crate::miner_settings::response_settings_json(Some(&settings));
+            // The modal reads restart_required off j.settings to decide
+            // whether to show the badge.
+            sj["restart_required"] = json!(true);
+            Json(json!({
+                "ok": true,
+                "settings": sj,
+                "restart_required": true,
+                "detail": "saved -- restart to apply",
+            }))
+        }
+        Err(e) => Json(json!({
+            "ok": false,
+            "detail": format!("persist failed: {e}"),
+        })),
+    }
+}
+
+/// `POST /restart` -- apply saved settings now by rebooting the device.
+/// A daemon-only restart is NOT safe on this board: the fork's RTOS IPC
+/// service does not recover when its client (mujina-minerd) dies -- the
+/// next daemon starts fine but its IPC connect blocks forever and nothing
+/// mines until a power cycle (found the hard way 2026-09-12; stock
+/// firmware behaves the same way, rebooting the device when settings are
+/// applied). A detached sleep+reboot subshell lets this response reach
+/// the wire before the system goes down; the startup scripts bring the
+/// whole stack back with the new settings.
+async fn restart_miner() -> Json<Value> {
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("(sleep 1; reboot) >/dev/null 2>&1 &")
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            Json(json!({"ok": true, "detail": "rebooting -- back in ~1-2 min"}))
+        }
+        Ok(out) => Json(json!({
+            "ok": false,
+            "detail": String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        })),
+        Err(e) => Json(json!({"ok": false, "detail": e.to_string()})),
+    }
 }
 
 async fn serve_page() -> impl IntoResponse {
