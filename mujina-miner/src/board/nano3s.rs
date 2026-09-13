@@ -246,10 +246,11 @@ const NANO3S_EXPECTED_HASHRATE_GHS: f64 = 100.0;
 ///
 /// - **Stock** (default): the factory LOW ramp, the stock 3800mV voltage
 ///   ceiling, and a 120W hard safety trip. Safe on the 140W stock PSU.
-/// - **OC**: the factory HIGH ramp with the power-target safety trip
-///   raised to the device's measured 133W hard ceiling, so a 130W target
-///   is actually reachable (stock mode's 120W trip would fight it). Still
-///   tuned for the 140W stock PSU.
+/// - **OC**: the factory HIGH ramp, power targets up to the device's
+///   measured 150W practical ceiling, and a safety trip that always sits
+///   above the commanded target (see `safety_trip_w`). Tuned for the
+///   stock 140W PSU up to ~133W; targets above that assume an external
+///   supply.
 /// - **Bypass**: every software restraint off -- the API's full 500MHz
 ///   frequency range, voltage past the stock ceiling, and no power
 ///   safety trip at all. For an external PSU only; nothing here protects
@@ -312,10 +313,21 @@ impl PowerMode {
     /// Watts above which the power-target loop force-steps voltage down
     /// immediately, regardless of target or interval. `None` disables the
     /// trip (Bypass only).
-    fn safety_trip_w(self) -> Option<f64> {
+    ///
+    /// The trip always sits above the power target the loop is currently
+    /// seeking (`current_power_target_w`), so a commanded target can never
+    /// be fought by its own safety trip -- that was the OC-mode bug where
+    /// a target above the old fixed 133W was "accepted" and then silently
+    /// dragged back down forever. `target` must be the loop's active
+    /// target (Some), not the mode's default.
+    fn safety_trip_w_for(self, target: Option<f64>) -> Option<f64> {
+        const TRIP_HEADROOM_W: f64 = 8.0;
         match self {
             PowerMode::Stock => Some(120.0),
-            PowerMode::Overclock => Some(133.0),
+            PowerMode::Overclock => match target {
+                Some(t) => Some(t + TRIP_HEADROOM_W),
+                None => Some(133.0),
+            },
             PowerMode::Bypass => None,
         }
     }
@@ -328,14 +340,15 @@ impl PowerMode {
         (vmin as u32, vmax as u32)
     }
 
-    /// Highest power target the REST API may set in this mode. Stock/OC
-    /// stay short of the device's 133W hard ceiling; Bypass allows a
-    /// target beyond it for external PSUs (the loop itself is still just
-    /// a +/-26mV servo, and its safety trip is off in this mode).
+    /// Highest power target the REST API may set in this mode. OC allows
+    /// up to the device's measured practical ceiling (150W; the trip then
+    /// rides above it -- see `safety_trip_w_for`); Bypass allows up to the
+    /// API's absolute 250W bound for external PSUs. The loop itself is
+    /// still just a +/-26mV servo.
     fn api_max_power_target_w(self) -> f64 {
         match self {
             PowerMode::Stock => 130.0,
-            PowerMode::Overclock => 133.0,
+            PowerMode::Overclock => 150.0,
             PowerMode::Bypass => 250.0,
         }
     }
@@ -381,12 +394,21 @@ fn save_power_mode(mode: PowerMode) {
 pub(crate) fn get_power_mode_state() -> crate::api_client::types::BoardPowerModeState {
     let mode = load_power_mode();
     let (vmin, vmax) = mode.api_voltage_range_mv();
+    // Report the trip as it actually behaves: it rides above the live
+    // power target, not at a fixed mode ceiling.
+    let live_target = read_persisted_tuning()
+        .and_then(|t| t.power_target_w)
+        .or_else(|| {
+            std::env::var("MUJINA_NANO3S_POWER_TARGET_W")
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+        });
     crate::api_client::types::BoardPowerModeState {
         mode: mode.as_str().to_string(),
         ramp_freq_mhz: mode.ramp_target(),
         voltage_range_mv: [vmin, vmax],
         max_power_target_w: mode.api_max_power_target_w(),
-        safety_trip_w: mode.safety_trip_w(),
+        safety_trip_w: mode.safety_trip_w_for(live_target),
     }
 }
 
@@ -402,6 +424,95 @@ pub(crate) fn write_power_mode_command(mode: &str) -> Result<(), String> {
         ));
     }
     std::fs::write(MUJINA_CONTROL_FILE, format!("mode:{mode}")).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Persisted manual tuning
+// ---------------------------------------------------------------------------
+
+/// Where the last `tune:` command's values persist across reboots. The
+/// RTOS does not retain custom clocks/voltage through a power cycle (it
+/// re-enumerates at its ~100MHz cold bring-up default and re-ramps to the
+/// mode target), so without this file a manual tune silently reverted on
+/// every reboot.
+const TUNING_FILE: &str = "/data/mujina_tuning";
+
+/// The last successfully applied `tune:` values, persisted to
+/// [`TUNING_FILE`] as `freq=a,b,c,d;volt=mv;power=w` (omitted fields are
+/// simply absent). Reapplied by `run_worker()` after the startup ramp.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PersistedTuning {
+    pll_freq_mhz: Option<[u32; 4]>,
+    voltage_mv: Option<i32>,
+    power_target_w: Option<f64>,
+}
+
+impl PersistedTuning {
+    fn is_empty(self) -> bool {
+        self.pll_freq_mhz.is_none()
+            && self.voltage_mv.is_none()
+            && self.power_target_w.is_none()
+    }
+
+    fn serialize(self) -> String {
+        let mut parts = Vec::new();
+        if let Some(f) = self.pll_freq_mhz {
+            parts.push(format!("freq={},{},{},{}", f[0], f[1], f[2], f[3]));
+        }
+        if let Some(v) = self.voltage_mv {
+            parts.push(format!("volt={v}"));
+        }
+        if let Some(w) = self.power_target_w {
+            parts.push(format!("power={w}"));
+        }
+        parts.join(";")
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        let mut out = Self::default();
+        for part in s.trim().split(';') {
+            let Some((key, val)) = part.split_once('=') else {
+                continue;
+            };
+            match key {
+                "freq" => {
+                    let fields: Vec<&str> = val.split(',').collect();
+                    if fields.len() != 4 {
+                        return None;
+                    }
+                    let f: Result<Vec<u32>, _> = fields.iter().map(|x| x.parse::<u32>()).collect();
+                    out.pll_freq_mhz = f.ok()?.try_into().ok();
+                }
+                "volt" => out.voltage_mv = val.parse::<i32>().ok(),
+                "power" => out.power_target_w = val.parse::<f64>().ok(),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+}
+
+fn save_persisted_tuning(t: PersistedTuning) {
+    if let Err(e) = std::fs::write(TUNING_FILE, t.serialize()) {
+        eprintln!("[nano3s] failed to persist tuning to {TUNING_FILE}: {e}");
+    }
+}
+
+fn read_persisted_tuning() -> Option<PersistedTuning> {
+    let raw = std::fs::read_to_string(TUNING_FILE).ok()?;
+    let t = PersistedTuning::parse(&raw)?;
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// Clears the persisted tuning file (used when the operator switches
+/// power modes, so the new mode's defaults aren't silently re-overridden
+/// by stale custom values after the next reboot).
+fn clear_persisted_tuning() {
+    let _ = std::fs::remove_file(TUNING_FILE);
 }
 
 /// Ceiling on a single nonce's recorded difficulty for the fleet-level
@@ -1843,12 +1954,52 @@ fn run_worker(
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok());
     let mut next_power_check = std::time::Instant::now() + POWER_TARGET_CHECK_INTERVAL;
+    // Set when the operator commands a raw voltage via `tune:` -- the
+    // power-target servo then stops adjusting voltage (a later
+    // `power_target:` command re-engages it). Without this, the loop
+    // would silently overwrite the manual voltage on its next check.
+    let mut voltage_override = false;
     // `resume_from_idle()` re-powers and re-enumerates the chain, which
     // lands back at rtos_core's ~100MHz cold bring-up default. Track what
     // was actually last applied via a `tune:` command (defaulting to the
     // startup ramp target) and reapply both after every resume.
     let mut last_applied_pll_freq: [u32; 4] = power_mode.ramp_target();
     let mut last_applied_voltage_mv: Option<i32> = None;
+
+    // Reapply operator tuning persisted from a previous session (see
+    // PersistedTuning): the RTOS re-enumerates at its cold bring-up
+    // default on every power cycle, so without this a custom tune
+    // silently reverted on every reboot. Order matters: clocks first
+    // (mirrors the startup ramp), then voltage, then the power-target
+    // loop seed. Voltage is clamped into the active mode's range so a
+    // bypass-era value can't survive a switch back to stock/oc.
+    if ipc_ok {
+        if let Some(t) = read_persisted_tuning() {
+            if let Some(freq) = t.pll_freq_mhz {
+                let rc = unsafe { nano3s_ipc_set_mode(freq.as_ptr(), 0) };
+                if rc == 0 {
+                    last_applied_pll_freq = freq;
+                    eprintln!("[nano3s] reapplied persisted pll_freq={freq:?}");
+                }
+            }
+            if let Some(mv) = t.voltage_mv {
+                let (vmin, vmax) = power_mode.voltage_range_mv();
+                let clamped = mv.clamp(vmin, vmax);
+                let rc = unsafe { nano3s_ipc_set_voltage_raw(clamped) };
+                if rc == 0 {
+                    last_applied_voltage_mv = Some(clamped);
+                    eprintln!("[nano3s] reapplied persisted voltage={clamped}mV");
+                }
+            }
+            if let Some(w) = t.power_target_w {
+                power_target_w = Some(w);
+                next_power_check = std::time::Instant::now() + POWER_TARGET_CHECK_INTERVAL;
+                eprintln!(
+                    "[nano3s] reapplied persisted power target={w:.1}W (overrides env seed)"
+                );
+            }
+        }
+    }
 
     loop {
         // Poll for an external pause/resume via MUJINA_CONTROL_FILE,
@@ -1898,6 +2049,13 @@ fn run_worker(
                     Some(new_mode) => {
                         power_mode = new_mode;
                         save_power_mode(new_mode);
+                        // Mode switches reset the operating envelope:
+                        // drop persisted custom tuning so the new mode's
+                        // defaults aren't overridden by stale values after
+                        // the next reboot, and re-engage the power-target
+                        // servo if a raw voltage had latched it off.
+                        clear_persisted_tuning();
+                        voltage_override = false;
                         eprintln!(
                             "[nano3s] power mode: {} (re-ramping + clamping voltage)",
                             new_mode.as_str()
@@ -1961,8 +2119,13 @@ fn run_worker(
                                     eprintln!("[nano3s] tuning: nano3s_ipc_set_voltage_raw failed");
                                 } else {
                                     last_applied_voltage_mv = Some(mv);
+                                    // The operator commanded raw voltage: the
+                                    // power-target servo must stop stepping over
+                                    // it until a new power-target command
+                                    // re-engages the loop.
+                                    voltage_override = true;
                                     eprintln!(
-                                        "[nano3s] tuning: SET_VOLTAGE_RAW target_mv={mv} (via dashboard/API)"
+                                        "[nano3s] tuning: SET_VOLTAGE_RAW target_mv={mv} (via dashboard/API; power-target loop paused)"
                                     );
                                 }
                             }
@@ -1974,6 +2137,11 @@ fn run_worker(
                             Ok(w) => {
                                 power_target_w = Some(w);
                                 next_power_check = std::time::Instant::now();
+                                // Same semantics as the dedicated
+                                // `power_target:` command: a fresh target
+                                // re-engages the servo after a raw-voltage
+                                // override.
+                                voltage_override = false;
                                 eprintln!(
                                     "[nano3s] tuning: power-target set to {w:.1}W (via dashboard/API)"
                                 );
@@ -1981,12 +2149,31 @@ fn run_worker(
                             Err(_) => eprintln!("[nano3s] malformed tune power-target field: {s}"),
                         }
                     }
+                    // Persist whatever was commanded (successes only --
+                    // failed IPC calls are not latched into the
+                    // last_applied_* trackers above) so the values survive
+                    // a reboot. Cleared by a `mode:` switch.
+                    let persisted = PersistedTuning {
+                        pll_freq_mhz: Some(last_applied_pll_freq),
+                        voltage_mv: last_applied_voltage_mv,
+                        power_target_w,
+                    };
+                    if !persisted.is_empty() {
+                        save_persisted_tuning(persisted);
+                    }
                 }
             }
             Some(s) if s.starts_with("power_target:") => {
                 let v = &s["power_target:".len()..];
                 if v == "off" {
                     power_target_w = None;
+                    voltage_override = false;
+                    // Keep clocks/voltage; drop only the power target.
+                    save_persisted_tuning(PersistedTuning {
+                        pll_freq_mhz: Some(last_applied_pll_freq),
+                        voltage_mv: last_applied_voltage_mv,
+                        power_target_w: None,
+                    });
                     eprintln!("[nano3s] power-target: disabled via dashboard/API");
                 } else {
                     match v.parse::<f64>() {
@@ -1995,6 +2182,16 @@ fn run_worker(
                             // Act on the new target at the next check
                             // rather than waiting out the old interval.
                             next_power_check = std::time::Instant::now();
+                            // A fresh target command re-engages the servo
+                            // after a raw-voltage override.
+                            voltage_override = false;
+                            // Persist so the target survives a reboot
+                            // (otherwise the startup env seed wins).
+                            save_persisted_tuning(PersistedTuning {
+                                pll_freq_mhz: Some(last_applied_pll_freq),
+                                voltage_mv: last_applied_voltage_mv,
+                                power_target_w: Some(w),
+                            });
                             eprintln!(
                                 "[nano3s] power-target: live target set to {w:.1}W via dashboard/API"
                             );
@@ -2147,16 +2344,20 @@ fn run_worker(
                 let cur_mv = st.voltage_mv as i32;
                 let now = std::time::Instant::now();
 
-                // The active mode's hard safety trip (None in bypass --
-                // that's the whole point of the mode).
+                // The active mode's hard safety trip, which rides above
+                // the commanded target (None in bypass -- that's the whole
+                // point of the mode). The old fixed per-mode trip fought
+                // any target set above it: the value was accepted and then
+                // silently dragged back down forever.
                 let step = if power_mode
-                    .safety_trip_w()
+                    .safety_trip_w_for(power_target_w)
                     .is_some_and(|trip| power_w > trip)
                 {
                     // Hard safety trip -- always allowed, ignores the
-                    // interval gate.
+                    // interval gate (and the manual-voltage override:
+                    // protection stays active in every configuration).
                     Some(-POWER_TARGET_STEP_MV)
-                } else if now >= next_power_check {
+                } else if !voltage_override && now >= next_power_check {
                     if power_w < target_w - POWER_TARGET_DEADBAND_W {
                         Some(POWER_TARGET_STEP_MV)
                     } else if power_w > target_w + POWER_TARGET_DEADBAND_W {
@@ -2180,8 +2381,18 @@ fn run_worker(
                         eprintln!(
                             "[nano3s] power-target: power={power_w:.1}W target={target_w:.1}W cur={cur_mv}mV -> {new_mv}mV"
                         );
-                        if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None) {
-                            eprintln!("[nano3s] power-target: failed to write tuning command: {e}");
+                        // Apply directly via IPC: routing through the
+                        // control file would re-enter the `tune:` handler
+                        // on the next loop pass, latch voltage_override
+                        // and permanently disable this loop after its own
+                        // first step (only the safety trip kept firing).
+                        let rc = unsafe { nano3s_ipc_set_voltage_raw(new_mv) };
+                        if rc == 0 {
+                            last_applied_voltage_mv = Some(new_mv);
+                        } else {
+                            eprintln!(
+                                "[nano3s] power-target: set_voltage_raw({new_mv}) failed rc={rc}"
+                            );
                         }
                     }
                     next_power_check = now + POWER_TARGET_CHECK_INTERVAL;
@@ -2224,8 +2435,11 @@ fn run_worker(
 
             // Full per-chip + chain-wide detail snapshot for the
             // dashboard's Info page (GET /nano3s-detail).
-            let (shares_accepted, shares_rejected) =
+            let (sv1_a, sv1_r) =
                 crate::job_source::stratum_v1::share_accept_reject_counts();
+            let (sv2_a, sv2_r) =
+                crate::job_source::stratum_v2::sv2_share_accept_reject_counts();
+            let (shares_accepted, shares_rejected) = (sv1_a + sv2_a, sv1_r + sv2_r);
             let chips: Vec<Nano3sChipDetail> = (0..st.chip_count as usize)
                 .filter(|&i| i < NANO3S_STATUS_MAX_CHIPS)
                 .map(|i| {

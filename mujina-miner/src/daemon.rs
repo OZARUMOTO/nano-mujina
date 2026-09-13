@@ -20,6 +20,7 @@ use crate::{
         dummy::DummySource,
         forced_rate::{ForcedRateConfig, ForcedRateSource},
         stratum_v1::StratumV1Source,
+        stratum_v2::{StratumV2Source, Sv2PoolConfig},
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
@@ -166,15 +167,45 @@ impl Daemon {
                 }
             }
 
-            let stratum_config = StratumPoolConfig {
-                url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
-                user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-            };
+            // Stratum v2 (extended channel) when the URL scheme asks for
+            // it; SV1 otherwise. Same settings file, same worker-suffix
+            // logic above.
+            if pool_url.starts_with("stratum+2://") || pool_url.starts_with("sv2://") {
+                let sv2_config = Sv2PoolConfig {
+                    url: pool_url.clone(),
+                    username: pool_user,
+                    password: pool_pass,
+                    user_agent: "mujina-miner/0.1.0-alpha".to_string(),
+                };
+                let sv2_source = StratumV2Source::new(
+                    sv2_config,
+                    source_cmd_rx,
+                    source_event_tx,
+                    self.shutdown.clone(),
+                );
+                let sv2_name = sv2_source.name();
 
-            // Optionally wrap with ForcedRateSource for testing
-            if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
+                source_reg_tx
+                    .send(SourceRegistration {
+                        name: sv2_name,
+                        url: Some(pool_url.clone()),
+                        event_rx: source_event_rx,
+                        command_tx: source_cmd_tx,
+                    })
+                    .await?;
+
+                self.tracker.spawn(async move {
+                    if let Err(e) = sv2_source.run().await {
+                        error!("Stratum v2 source error: {}", e);
+                    }
+                });
+            } else if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
+                let stratum_config = StratumPoolConfig {
+                    url: pool_url.clone(),
+                    username: pool_user,
+                    password: pool_pass,
+                    user_agent: "mujina-miner/0.1.0-alpha".to_string(),
+                };
                 info!(
                     rate = %forced_rate_config.target_rate,
                     "Forced share rate wrapper enabled"
@@ -226,6 +257,12 @@ impl Daemon {
                 });
             } else {
                 // Direct stratum source (no wrapper)
+                let stratum_config = StratumPoolConfig {
+                    url: pool_url.clone(),
+                    username: pool_user,
+                    password: pool_pass,
+                    user_agent: "mujina-miner/0.1.0-alpha".to_string(),
+                };
                 let stratum_source = StratumV1Source::new(
                     stratum_config,
                     source_cmd_rx,
