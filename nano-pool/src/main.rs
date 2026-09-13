@@ -293,10 +293,13 @@ fn build_coinbase(tpl: &NodeTemplate, cfg: &Config) -> Coinbase {
     prefix.extend_from_slice(&height_push);
     prefix.push(tag.len() as u8);
     prefix.extend_from_slice(tag);
-    let used = height_push.len() + 1 + tag.len();
-    // The channel's extranonce_prefix goes HERE (device inserts its 8-byte
-    // extranonce right after). Padding fills the remainder so the scriptSig
-    // length declared above always matches the assembled tx exactly.
+    // The channel's extranonce_prefix (6-byte base + 4-byte channel tag)
+    // goes HERE, and the device appends its 8-byte extranonce right after
+    // it — all INSIDE the declared scriptSig. The padding must leave room
+    // for those 18 bytes so the assembled tx's scriptSig is exactly
+    // SCRIPT_SIG_LEN, matching the varint above.
+    const ENSPACE: usize = 10 + 8;
+    let used = height_push.len() + 1 + tag.len() + ENSPACE;
     prefix.extend(std::iter::repeat(0u8).take(SCRIPT_SIG_LEN - used));
 
     let mut suffix = Vec::with_capacity(46);
@@ -337,6 +340,7 @@ struct PoolState {
     next_job_id: u32,
     active: Option<ActiveJob>,
     shares_ok: u64,
+    last_prev: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,27 +361,36 @@ async fn main() -> Result<()> {
         next_job_id: 1,
         active: None,
         shares_ok: 0,
+        last_prev: String::new(),
     }));
     let (job_tx, _) = broadcast::channel::<Outgoing>(16);
 
-    // Template refresher: poll GBT-Light; on a new prevhash, publish the
-    // job + prevhash downstream. BCH blocks are ~10 min apart, so 5s
-    // polling adds negligible RPC load and picks up template refreshes.
+    // Template refresher: poll GBT-Light. Only rotate the downstream job
+    // when the node's template actually CHANGED (its job_id is
+    // content-derived): churning the SV2 job id on every poll orphans the
+    // work the device is hashing and every share bounces job-not-found.
+    // New tip -> future job + SetNewPrevHash; same tip but refreshed
+    // template (mempool moved) -> immediate job (min_ntime=Some uses the
+    // last SetNewPrevHash prev-hash, per the SV2 mining protocol).
     {
         let state = state.clone();
         let job_tx = job_tx.clone();
         tokio::spawn(async move {
-            let mut last_prev = String::new();
             loop {
                 let cfg = state.lock().await.cfg.clone();
                 match fetch_template(&cfg).await {
                     Ok(tpl) => {
-                        let new_block = tpl.prev_hash.to_string() != last_prev;
-                        if new_block {
-                            info!(height = tpl.height, prev = %tpl.prev_hash, "template");
-                            last_prev = tpl.prev_hash.to_string();
-                        }
                         let mut st = state.lock().await;
+                        if st
+                            .active
+                            .as_ref()
+                            .map(|a| a.node_job_id == tpl.job_id)
+                            .unwrap_or(false)
+                        {
+                            continue; // unchanged template, keep current job
+                        }
+                        let new_tip = st.last_prev != tpl.prev_hash.to_string();
+                        st.last_prev = tpl.prev_hash.to_string();
                         let sv2_id = st.next_job_id;
                         st.next_job_id += 1;
                         // carry the channel prefix across jobs if one is open
@@ -388,10 +401,15 @@ async fn main() -> Result<()> {
                             .unwrap_or_else(|| st.cfg.extranonce_base.clone());
                         let mut job = make_job(&tpl, &st.cfg, sv2_id);
                         job.extranonce_prefix = prefix;
-                        if new_block {
-                            let (j, ph) = to_sv2_messages(&job);
+                        let (mut j, ph) = to_sv2_messages(&job);
+                        if new_tip {
+                            info!(height = tpl.height, prev = %tpl.prev_hash, "new template (new tip)");
                             let _ = job_tx.send(Outgoing::Job(j));
                             let _ = job_tx.send(Outgoing::PrevHash(ph));
+                        } else {
+                            info!(height = tpl.height, "template refreshed (same tip)");
+                            j.min_ntime = Sv2Option::new(Some(job.min_ntime));
+                            let _ = job_tx.send(Outgoing::Job(j));
                         }
                         st.active = Some(job);
                     }
@@ -569,12 +587,15 @@ async fn handle_downstream(
                             return Err(anyhow!("open before setup"));
                         }
                         let target: [u8; 32] = {
-                            // ~2^224 ceiling: solo pool only cares about
-                            // block-finding; a stream of easy shares gives
-                            // the dashboard live stats.
+                            // ~difficulty 1 (2^224-ish): solo pool only
+                            // cares about block-finding, but a stream of
+                            // easy shares gives the dashboard live stats
+                            // (~1-5 shares/s at 6 TH/s). Bytes land at
+                            // [26..28] so the device's little-endian parse
+                            // sees the same magnitude.
                             let mut t = [0u8; 32];
-                            t[3] = 0xff;
-                            t[2] = 0xff;
+                            t[27] = 0xff;
+                            t[26] = 0xff;
                             t
                         };
                         let extranonce_size = 8u16;
