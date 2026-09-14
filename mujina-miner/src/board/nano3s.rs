@@ -18,19 +18,32 @@
 //! spliced into the coinbase right after it, so the coinbase length and
 //! merkle root match what the pool expects.
 //!
-//! # Byte-order notes
+//! # Byte-order notes (verified end-to-end: a pool-assembled block built
+//! from these exact conventions was accepted by bitcoind on regtest with
+//! a device-mined share as the coinbase nonce, and the chip hashes
+//! nonces big-endian -- see verify_and_build_share()).
 //!
-//! - `prev_blockhash` goes into the header buffer via
-//!   `BlockHash::to_byte_array()` unchanged -- no word-reversal, no
-//!   byte-swap.
+//! - `build_header_bytes()` writes `prev_blockhash` word-swapped
+//!   (`word_bswap32`) -- the raw wire order the chip's register loading
+//!   expects -- and `ntime`/`bits` big-endian. (An earlier version of
+//!   these notes claimed "no swap, native LE everywhere"; that described
+//!   the transplanted stock-driver convention, not this chain, and was
+//!   wrong. `nonce_probe`'s nmerkles=0 nonces verified offline under the
+//!   word-swapped/BE convention.)
 //! - Merkle branches (`MerkleRootTemplate::merkle_branches`) are used
-//!   raw, no reversal, matching
-//!   `MerkleRootTemplate::compute_merkle_root()`'s climb algorithm.
-//! - The 4-byte nonce2 is written into the coinbase in little-endian byte
-//!   order (`nonce2.to_le_bytes()`), matching `miner_gen_nonce2_work()`'s
-//!   raw `memcpy` of nonce2's native in-memory bytes.
-//! - version/ntime/nbits are stored as plain native (little-endian on
-//!   this riscv64 target) `u32` words, no swap.
+//!   raw, no reversal: rtos_core's `bitcoin_build_nonce2_job()` folds
+//!   them in raw and writes the root into the header word-swapped
+//!   (`store_merkle_root`), matching the descending-word work load in
+//!   `asic_job.c`. The Rust verify path recomputes the root
+//!   independently in internal byte order (same fold, no swap), which
+//!   hashes identically once placed in a consensus-order header.
+//! - The 4-byte nonce2 is written into the coinbase little-endian,
+//!   matching `miner_gen_nonce2_work()`'s raw `memcpy` of nonce2's
+//!   native in-memory bytes.
+//! - The 32-bit nonce found by the silicon arrives in its natural
+//!   BIG-endian byte order; consensus serialization (and the pool) must
+//!   treat it as such -- `verify_and_build_share()` swaps it into the
+//!   Header, and nano-pool hashes `nonce.to_be_bytes()`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
