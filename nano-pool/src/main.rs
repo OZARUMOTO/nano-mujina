@@ -33,7 +33,7 @@ use stratum_apps::stratum_core::{
     codec_sv2::StandardSv2Frame,
     common_messages_sv2::{Protocol, SetupConnectionSuccess},
     mining_sv2::{
-        NewExtendedMiningJob, OpenExtendedMiningChannelSuccess, SetNewPrevHash,
+        NewExtendedMiningJob, OpenExtendedMiningChannelSuccess, SetNewPrevHash, SetTarget,
         SubmitSharesError, SubmitSharesExtended, SubmitSharesSuccess,
     },
     parsers_sv2::{CommonMessages, Mining, MiningDeviceMessages},
@@ -49,6 +49,79 @@ type StdFrame = StandardSv2Frame<MiningDeviceMessages<'static>>;
 enum Outgoing {
     Job(NewExtendedMiningJob<'static>),
     PrevHash(SetNewPrevHash<'static>),
+    /// Mid-session difficulty retarget (vardiff). The device applies it to
+    /// every template it builds from then on (mujina-miner SetTarget handler
+    /// -> session.share_target_le), same mechanism as the SRI reference pool.
+    Target(SetTarget<'static>),
+}
+
+/// Vardiff target: shares per second the pool wants from the device.
+/// ~1/s keeps the SV2 message stream trivial for the device's little core
+/// (a diff-1 flood at 6 TH/s starved it — 2026-09-14 incident) while still
+/// feeding the stats panel and the hashrate estimator plenty of samples.
+const TARGET_SHARES_PER_SEC: f64 = 1.0;
+const VARDIFF_MIN_DIFF: f64 = 256.0;
+const VARDIFF_MAX_DIFF: f64 = 65536.0;
+
+/// Integral vardiff controller (ckpool's vardiff philosophy, single
+/// downstream): measure the accepted-share rate over a window, scale the
+/// difficulty by measured/target, retarget only on a significant move
+/// (hysteresis) so the device isn't churned. Clamps bound both failure
+/// modes: a flood (min) and months-per-share silence (max).
+#[derive(Clone)]
+struct Vardiff {
+    /// current share difficulty in standard units (diff-1 = 1.0)
+    current_diff: f64,
+    /// share rate over the last window (EMA across windows)
+    rate_ema: f64,
+    /// accepted shares since the last retarget
+    shares_since: u64,
+    last_retarget: std::time::Instant,
+    window_s: f64,
+}
+
+impl Vardiff {
+    fn new() -> Self {
+        Self {
+            current_diff: VARDIFF_MIN_DIFF,
+            rate_ema: 0.0,
+            shares_since: 0,
+            last_retarget: std::time::Instant::now(),
+            window_s: 120.0,
+        }
+    }
+
+    /// little-endian U256 target for the current difficulty (wire byte
+    /// order for OpenExtendedMiningChannelSuccess.target and
+    /// SetTarget.maximum_target; the device reads it LE and stamps every
+    /// template with it).
+    fn target_le(&self) -> [u8; 32] {
+        diff_to_target_le(self.current_diff)
+    }
+}
+
+/// difficulty d -> 32-byte little-endian target: t = diff1 / d with
+/// diff1 = 65535 * 2^208 (bitcoin's 0x1d00ffff). Construction: q = 65535/d
+/// has its integer part (<= 65535) at bit 208 (bytes 26..27) and 64 bits
+/// of fraction at bit 144 (bytes 18..25); bits below 2^144 are truncated,
+/// which can only make the target HARDER, never easier. Byte order: the
+/// device reads this U256 LITTLE-endian, and setting MORE low bytes makes
+/// the target EASIER (that mistake once produced a diff-0.75 flood; a
+/// bit-shift-as-byte-index mistake briefly produced an all-zero target
+/// and a silent device). d=256 reproduces the proven t[26]=0xff encoding
+/// within 0.4%.
+fn diff_to_target_le(d: f64) -> [u8; 32] {
+    let d = d.clamp(1.0, 2f64.powi(48));
+    let q = 65535.0 / d;
+    let iq = q.floor() as u64; // <= 65535: fits bytes 26..27 exactly
+    let ff = ((q - q.floor()) * 2f64.powi(64)) as u64;
+    let mut t = [0u8; 32];
+    t[26] = (iq & 0xff) as u8;
+    t[27] = ((iq >> 8) & 0xff) as u8;
+    for i in 0..8 {
+        t[18 + i] = ((ff >> (8 * i)) & 0xff) as u8;
+    }
+    t
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +445,8 @@ struct PoolState {
     connections: u64,
     /// currently connected (set in setup handler)
     device_connected: bool,
+    /// share-difficulty controller (~1/s share rate regardless of hashrate)
+    vardiff: Vardiff,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +478,7 @@ async fn main() -> Result<()> {
         share_times: std::collections::VecDeque::new(),
         connections: 0,
         device_connected: false,
+        vardiff: Vardiff::new(),
     }));
     let (job_tx, _) = broadcast::channel::<Outgoing>(16);
 
@@ -493,8 +569,9 @@ async fn main() -> Result<()> {
         let (stream, addr) = listener.accept().await?;
         let state = state.clone();
         let job_rx = job_tx.subscribe();
+        let job_tx = job_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_downstream(stream, state, job_rx).await {
+            if let Err(e) = handle_downstream(stream, state, job_rx, job_tx).await {
                 error!(%addr, "downstream: {e:#}");
             }
         });
@@ -545,6 +622,7 @@ async fn handle_downstream(
     stream: TcpStream,
     state: Arc<AMutex<PoolState>>,
     mut job_rx: broadcast::Receiver<Outgoing>,
+    job_tx: broadcast::Sender<Outgoing>,
 ) -> Result<()> {
     // Local pool static Noise keys (no authority pinning — solo rig only).
     // hex priv: 242d334c034463ac4dee875ac09220f6183f60c505ebcecb2c5ae22c2c3057c1
@@ -599,6 +677,8 @@ async fn handle_downstream(
                                 MiningDeviceMessages::Mining(Mining::NewExtendedMiningJob(j)),
                             Outgoing::PrevHash(p) =>
                                 MiningDeviceMessages::Mining(Mining::SetNewPrevHash(p)),
+                            Outgoing::Target(t) =>
+                                MiningDeviceMessages::Mining(Mining::SetTarget(t)),
                         };
                         let _ = out_tx.send(msg).await;
                     }
@@ -654,26 +734,24 @@ async fn handle_downstream(
                         if !setup_done {
                             return Err(anyhow!("open before setup"));
                         }
-                        let target: [u8; 32] = {
-                            // ~difficulty 256: shares are only a stats
-                            // feed here (solo pool banks nothing), and at
-                            // 6 TH/s difficulty-1 flooded the device's
-                            // little core with hundreds of SV2 messages
-                            // per second -- it starved the dashboard API
-                            // and LCD (found live 2026-09-14). ~0.7
-                            // shares/s at 6 TH/s is plenty.
-                            //
-                            // Byte order: the device reads this U256 as
-                            // LITTLE-endian, so byte i weighs 2^(8i).
-                            // Diff-1 target ≈ 2^224 (bytes 26..28 set);
-                            // diff-256 = diff1/2^8 ≈ 2^216 → byte 26
-                            // only. (Setting MORE bytes makes the target
-                            // EASIER -- that mistake briefly took us to
-                            // diff ~0.75 and a 180/s flood.)
-                            let mut t = [0u8; 32];
-                            t[26] = 0xff;
-                            t
-                        };
+                        // Seed the vardiff controller. A sane self-report
+                        // (>= 1 TH) seeds d ≈ H / rate / 2^32 directly; a
+                        // stale boot-time report keeps the previous diff and
+                        // the controller converges from measured shares
+                        // within a window or two. Counters reset either way.
+                        {
+                            let mut st = state.lock().await;
+                            st.device_hashrate = m.nominal_hash_rate as f64;
+                            if m.nominal_hash_rate as f64 >= 1e12 {
+                                st.vardiff.current_diff = (m.nominal_hash_rate as f64
+                                    / TARGET_SHARES_PER_SEC
+                                    / 2f64.powi(32))
+                                .clamp(VARDIFF_MIN_DIFF, VARDIFF_MAX_DIFF);
+                            }
+                            st.vardiff.shares_since = 0;
+                            st.vardiff.last_retarget = std::time::Instant::now();
+                        }
+                        let target: [u8; 32] = state.lock().await.vardiff.target_le();
                         let extranonce_size = 8u16;
                         let (prefix, success) = {
                             let st = state.lock().await;
@@ -694,7 +772,6 @@ async fn handle_downstream(
                         // latch prefix onto the active job for share checks
                         {
                             let mut st = state.lock().await;
-                            st.device_hashrate = m.nominal_hash_rate as f64;
                             if let Some(job) = st.active.as_mut() {
                                 job.extranonce_prefix = prefix;
                                 job.extranonce_size = extranonce_size;
@@ -724,7 +801,7 @@ async fn handle_downstream(
                         info!("initial job + prevhash pushed");
                     }
                     MiningDeviceMessages::Mining(Mining::SubmitSharesExtended(m)) => {
-                        if let Err(e) = handle_share(&out_tx, &state, m).await {
+                        if let Err(e) = handle_share(&job_tx, &out_tx, &state, m).await {
                             error!("share: {e:#}");
                         }
                     }
@@ -742,6 +819,7 @@ async fn handle_downstream(
 }
 
 async fn handle_share(
+    job_tx: &broadcast::Sender<Outgoing>,
     out_tx: &mpsc::Sender<MiningDeviceMessages<'static>>,
     state: &Arc<AMutex<PoolState>>,
     m: SubmitSharesExtended<'static>,
@@ -849,8 +927,11 @@ async fn handle_share(
                 "FIRST REJECTED SHARE — full diagnostic dump"
             );
         }
-        let mut share_target_le = [0u8; 32];
-        share_target_le[26] = 0xff; // ~difficulty 256, LE (see channel open)
+        // Live channel target (vardiff-controlled). Byte order matches what
+        // was sent on the wire: the target travels LE in SV2, hashes
+        // compare BE. In-flight shares for the pre-retarget job can bounce
+        // here for one window after a retarget — a stats-only loss.
+        let share_target_le = state.lock().await.vardiff.target_le();
         let share_target_be: Vec<u8> = share_target_le.iter().rev().copied().collect();
         if hash_be.as_slice() > share_target_be.as_slice() {
             // Byte-order forensics: hash the SAME nonce/ntime under the
@@ -1033,6 +1114,66 @@ async fn handle_share(
         }
     }
 
+    // ---- vardiff: hold the share rate near TARGET_SHARES_PER_SEC ----
+    // Integral control: measure the accepted-share rate over a window and
+    // scale the difficulty by measured/target. SetTarget goes through the
+    // same fan-out as jobs; the device applies it to every template it
+    // builds from then on. Because the template refresher only pushes new
+    // jobs when the node's template CHANGED, a retarget also re-issues the
+    // active job under a fresh sv2_job_id (same-tip min_ntime push — the
+    // proven refresh path) so the new target takes effect immediately.
+    {
+        let mut st = state.lock().await;
+        let vd = &mut st.vardiff;
+        vd.shares_since += 1;
+        let elapsed = vd.last_retarget.elapsed().as_secs_f64();
+        if elapsed >= vd.window_s {
+            let rate = vd.shares_since as f64 / elapsed;
+            vd.rate_ema = if vd.rate_ema == 0.0 {
+                rate
+            } else {
+                0.5 * vd.rate_ema + 0.5 * rate
+            };
+            let new_diff = (vd.current_diff * vd.rate_ema / TARGET_SHARES_PER_SEC)
+                .clamp(VARDIFF_MIN_DIFF, VARDIFF_MAX_DIFF);
+            let ratio = new_diff / vd.current_diff;
+            vd.shares_since = 0;
+            vd.last_retarget = std::time::Instant::now();
+            // Fire only on a significant move (hysteresis), never during
+            // the first seconds of a session (warm-up).
+            let fire = vd.rate_ema > 0.0
+                && elapsed > 30.0
+                && (ratio >= 1.5 || ratio <= 1.0 / 1.5);
+            vd.current_diff = new_diff;
+            if fire {
+                info!(
+                    measured_shares_per_sec = format!("{rate:.2}"),
+                    ema_shares_per_sec = format!("{:.2}", vd.rate_ema),
+                    new_diff = format!("{:.0}", new_diff),
+                    "vardiff retarget"
+                );
+                let _ = job_tx.send(Outgoing::Target(SetTarget {
+                    channel_id: 1,
+                    maximum_target: U256::from(diff_to_target_le(new_diff)),
+                }));
+                if let Some(mut nj) = st.active.clone() {
+                    if let Some(old) = st.active.take() {
+                        st.past_jobs.push_back(old);
+                        while st.past_jobs.len() > 16 {
+                            st.past_jobs.pop_front();
+                        }
+                    }
+                    nj.sv2_job_id = st.next_job_id;
+                    st.next_job_id += 1;
+                    let (mut j, _) = to_sv2_messages(&nj);
+                    j.min_ntime = Sv2Option::new(Some(nj.min_ntime));
+                    st.active = Some(nj);
+                    let _ = job_tx.send(Outgoing::Job(j));
+                }
+            }
+        }
+    }
+
     if hash_be.as_slice() <= target_be.as_slice() {
         // *** SOLO BLOCK CANDIDATE ***
         let mut block = header.clone();
@@ -1141,6 +1282,7 @@ async fn serve_stats_http(
     let self_report_th = st.device_hashrate / 1e12;
     let device_th = if derived_th > 0.0 { derived_th } else { self_report_th };
     let hr_source = if derived_th > 0.0 { "shares(5m)" } else { "self-report" };
+    let pool_diff = st.vardiff.current_diff;
     drop(st);
 
     // Hashrate shown is derived from accepted share work when available;
@@ -1159,6 +1301,8 @@ async fn serve_stats_http(
             "shares_per_sec": (shps * 100.0).round() / 100.0,
             "device_hashrate_th": (device_th * 100.0).round() / 100.0,
             "hashrate_source": hr_source,
+            "pool_share_diff": (pool_diff * 100.0).round() / 100.0,
+            "target_shares_per_sec": TARGET_SHARES_PER_SEC,
             "best_share_diff": if best.is_infinite() { json!("inf") } else { json!((best * 100.0).round() / 100.0) },
             "node_height": height,
             "network_nbits": bits.map(|b| format!("{b:08x}")),
@@ -1208,6 +1352,7 @@ code{{background:#161b22;padding:.1em .35em;border-radius:4px}}
 <div class=grid>
 <div class="card big"><div class=k>Shares</div><div class=v id=shares>{}</div></div>
 <div class="card big"><div class=k>Best share (difficulty)</div><div class=v id=best>{:.2}</div></div>
+<div class=card><div class=k>Pool share difficulty (auto)</div><div class=v id=diff>—</div></div>
 <div class=card><div class=k>Device hashrate (self-reported)</div><div class=v id=hr>{:.2} TH/s</div></div>
 <div class=card><div class=k>Device</div><div class=v>{}</div></div>
 <div class=card><div class=k>Uptime</div><div class=v>{}d {:02}h {:02}m</div></div>
@@ -1217,7 +1362,8 @@ code{{background:#161b22;padding:.1em .35em;border-radius:4px}}
 </div>
 <div class=banner id=banner>{}</div>
 <div class=note>
-Share difficulty is ~256 (stats feed only — one share per ~2^40 hashes).
+Share difficulty is auto-tuned (vardiff): the pool retargets the device so
+shares arrive ~{} /s (currently diff {:.0}).
 The <b>block</b> check runs on every share against the real BCH network target
 (nbits above): {} ≈ 1 in {:.0} per hash. Expected solo block interval at this
 hashrate: months. Payout: <code>{}</code><br>
@@ -1230,6 +1376,7 @@ setInterval(async()=>{{
   const s=await(await fetch('/stats')).json();
   shares.textContent=fmt(s.shares); hr.textContent=s.device_hashrate_th+' TH/s';
   best.textContent=(s.best_share_diff==="inf"?'∞':s.best_share_diff);
+  diff.textContent=fmt(s.pool_share_diff);
   height.textContent=fmt(s.node_height);
  }}catch(e){{}}
 }},5000);
@@ -1244,6 +1391,8 @@ setInterval(async()=>{{
         bits.map(|b| format!("{b:08x}")).unwrap_or_else(|| "—".into()),
         conns,
         banner,
+        TARGET_SHARES_PER_SEC,
+        pool_diff,
         bits.map(|b| format!("0x{b:08x}")).unwrap_or_else(|| "—".into()),
         {
             // difficulty from nbits for the note line
