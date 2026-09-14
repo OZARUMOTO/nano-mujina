@@ -370,6 +370,64 @@ connection.
 cargo run --bin mujina-minerd
 ```
 
+### Solo mining your own BCH node (Stratum V2)
+
+[`nano-pool/`](nano-pool/) is a single-downstream Stratum V2 pool that
+bridges the miner to a local Bitcoin-Cash-Node (BCHN) instance: it
+pulls block templates over GBT-Light (`getblocktemplatelight`),
+serves them to the device as SV2 extended-mining jobs, banks shares
+locally, and — when a hash clears the network target — assembles the
+block and submits it via `submitblocklight`. The reward pays the
+address of your choice. No fees, no third party: the pool and the
+node are both yours.
+
+Run the node and the bridge in Docker (the bridge joins the node's
+compose network so it can reach it by name):
+
+```bash
+# BCHN mainnet (or restore a snapshot datadir into ./mainnet first --
+# see below)
+docker run -d --name bchn-mainnet --restart unless-stopped \
+  -v /path/to/mainnet:/home/bitcoin/.bitcoin \
+  -p 8332:8332 -p 8333:8333 \
+  uphold/bitcoin-cash-node:29
+
+# nano-pool bridge
+docker run -d --name nano-pool --restart unless-stopped \
+  --network <compose-network-of-node> \
+  -p 3334:3334 \
+  -e NP_LISTEN=0.0.0.0:3334 \
+  -e NP_RPC=http://bchn-mainnet:8332 \
+  -e NP_USER=<node-rpc-user> \
+  -e NP_PASS=<node-rpc-pass> \
+  -e NP_PAYOUT=bitcoincash:q... \
+  -e RUST_LOG=info \
+  nano3s-build bash -lc "cargo run --release -p nano-pool --bin nano-pool"
+```
+
+Then point the miner at it from the dashboard's GLOBAL SETTINGS (or
+`POST /minersettings`):
+
+```
+stratum+2://<mac-ip>:3334
+```
+
+URLs with the `stratum+2://` (or `sv2://`) scheme select the SV2
+client; `stratum+tcp://` keeps using Stratum v1. Apply with
+`POST /restart` (a device reboot -- a daemon-only restart wedges this
+board's RTOS IPC).
+
+`NP_PAYOUT` is a BCH cashaddr; solo mining pays its whole coinbase
+there on a found block. Regtest addresses (`bchreg:q...`) work too --
+useful with a regtest node for end-to-end testing without waiting on
+mainnet difficulty.
+
+To skip a multi-week initial block download, restore a pre-synced
+BCHN datadir snapshot (Fullstack.cash publishes periodic ones, e.g.
+`bchn-2025-11-18-925569.zip`) into the mounted datadir, extracting
+`blocks/`, `chainstate/`, and `peers.dat`, then let the node tail-sync
+the remaining blocks (tens of minutes at normal peer speeds).
+
 ### Controlling log output
 
 The default filter emits Mujina log entries at info level and
