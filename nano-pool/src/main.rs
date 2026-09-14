@@ -342,6 +342,12 @@ struct PoolState {
     cfg: Config,
     next_job_id: u32,
     active: Option<ActiveJob>,
+    /// Past jobs under the current tip (SRI channels-sv2 JobStore semantics:
+    /// MAX_PAST_JOBS = 16). Shares legitimately arrive for the just-superseded
+    /// job while a template refresh races it; retaining them stops
+    /// job-not-found rejections that would otherwise eat the best shares.
+    /// Flushed on tip change (jobs from an old tip are stale by definition).
+    past_jobs: std::collections::VecDeque<ActiveJob>,
     shares_ok: u64,
     last_prev: String,
     // ---- solo-stats panel (served on NP_STATS_PORT) ----
@@ -356,6 +362,12 @@ struct PoolState {
     node_height: u64,
     /// device's self-reported hashrate (SV2 nominal_hash_rate, hashes/s)
     device_hashrate: f64,
+    /// recent accepted shares (arrival time, share difficulty): the raw
+    /// material for share-derived hashrate. Self-reported nominal_hash_rate
+    /// is sampled seconds after boot and can be off by orders of magnitude;
+    /// counting share work like ckpool's hashmeter / SRI's batch work-sum
+    /// gives a rate that reflects reality (6 TH/s, not 0.1).
+    share_times: std::collections::VecDeque<(std::time::Instant, f64)>,
     /// SV2 connections since start (device auto-reconnects; count them)
     connections: u64,
     /// currently connected (set in setup handler)
@@ -379,6 +391,7 @@ async fn main() -> Result<()> {
         cfg: cfg.clone(),
         next_job_id: 1,
         active: None,
+        past_jobs: std::collections::VecDeque::new(),
         shares_ok: 0,
         last_prev: String::new(),
         started: std::time::Instant::now(),
@@ -387,6 +400,7 @@ async fn main() -> Result<()> {
         last_block_result: "none yet".into(),
         node_height: 0,
         device_hashrate: 0.0,
+        share_times: std::collections::VecDeque::new(),
         connections: 0,
         device_connected: false,
     }));
@@ -443,6 +457,10 @@ async fn main() -> Result<()> {
                         let (mut j, ph) = to_sv2_messages(&job);
                         if new_tip {
                             st.node_height = tpl.height;
+                            // Jobs from the old tip can never extend it: stale
+                            // by definition (SRI JobStore flushes past jobs on
+                            // tip change).
+                            st.past_jobs.clear();
                             info!(height = tpl.height, prev = %tpl.prev_hash, "new template (new tip)");
                             let _ = job_tx.send(Outgoing::Job(j));
                             let _ = job_tx.send(Outgoing::PrevHash(ph));
@@ -450,6 +468,14 @@ async fn main() -> Result<()> {
                             info!(height = tpl.height, "template refreshed (same tip)");
                             j.min_ntime = Sv2Option::new(Some(job.min_ntime));
                             let _ = job_tx.send(Outgoing::Job(j));
+                        }
+                        // Retain the superseded same-tip job for in-flight
+                        // shares (cap 16, matching SRI MAX_PAST_JOBS).
+                        if let Some(old) = st.active.take() {
+                            st.past_jobs.push_back(old);
+                            while st.past_jobs.len() > 16 {
+                                st.past_jobs.pop_front();
+                            }
                         }
                         st.active = Some(job);
                     }
@@ -722,11 +748,18 @@ async fn handle_share(
 ) -> Result<()> {
     static ACCEPTED: AtomicU32 = AtomicU32::new(0);
 
+    // Active job first, then past jobs under this tip (in-flight share
+    // safety net — see PoolState::past_jobs).
     let job = {
         let st = state.lock().await;
-        st.active
-            .as_ref()
-            .and_then(|a| (a.sv2_job_id == m.job_id).then(|| a.clone()))
+        if let Some(a) = st.active.as_ref().filter(|a| a.sv2_job_id == m.job_id) {
+            Some(a.clone())
+        } else {
+            st.past_jobs
+                .iter()
+                .find(|j| j.sv2_job_id == m.job_id)
+                .cloned()
+        }
     };
     let Some(job) = job else {
         let err = SubmitSharesError {
@@ -759,18 +792,221 @@ async fn handle_share(
         root = Sha256d::hash(&buf).to_byte_array();
     }
 
-    // 80-byte header (prev_hash + merkle root in internal/LE order)
+    // 80-byte header (prev_hash + merkle root in internal/LE order).
+    //
+    // NONCE BYTE ORDER: the A3197S chip hashes the header with the nonce
+    // in its natural BIG-endian byte order — see the device's
+    // verify_and_build_share(), which reproduces the chip's hash with
+    // `nonce.swap_bytes()` in the consensus Header. The device's on-curve
+    // best-share telemetry proves H_chip == H_device_verify, so the pool
+    // must reconstruct that same BE-nonce header. Writing the raw nonce
+    // little-endian (the naive SV2 canonical form) hashes a header the
+    // chip never mined and fails every share with z≈0. If the device ever
+    // switches to spec-canonical submissions (swapping the nonce before
+    // send), revert this to to_le_bytes() in the same change.
     let mut header = Vec::with_capacity(80);
     header.extend_from_slice(&m.version.to_le_bytes());
     header.extend_from_slice(&job.prev_hash_internal);
     header.extend_from_slice(&root);
     header.extend_from_slice(&m.ntime.to_le_bytes());
     header.extend_from_slice(&job.bits.to_le_bytes());
-    header.extend_from_slice(&m.nonce.to_le_bytes());
+    header.extend_from_slice(&m.nonce.to_be_bytes());
 
     let hash_le = Sha256d::hash(&header).to_byte_array();
     let hash_be: Vec<u8> = hash_le.iter().rev().cloned().collect();
     let target_be = bits_to_target_be(job.bits);
+
+    // Share validation against the channel target (the diff-256 stats
+    // feed sent at channel open). Without this the pool accepts ANY
+    // submission — the device also forwards job-boundary nonces that
+    // meet no target — inflating share counts and flattening best-share
+    // telemetry to ~0. ckpool and the SRI reference pool both reject
+    // such shares with "difficulty-too-low"; doing the same makes every
+    // accepted share genuinely worth >= 256 diff, and best-diff
+    // meaningful. Block-caliber hashes (checked below against nbits)
+    // are unaffected — they clear this bar 2^68 times over.
+    {
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // One-shot convention check: the same share hashed under the
+            // old LE-nonce header. z_be_nonce >= 40 while z_le_nonce ~ 0
+            // confirms the byte-order diagnosis empirically.
+            let mut header_le_nonce = header.clone();
+            let n = header_le_nonce.len();
+            header_le_nonce[n - 4..].copy_from_slice(&m.nonce.to_le_bytes());
+            let h_le = Sha256d::hash(&header_le_nonce).to_byte_array();
+            let h_le_be: Vec<u8> = h_le.iter().rev().cloned().collect();
+            info!(
+                header = %hex::encode(&header),
+                hash_be = %hex::encode(&hash_be),
+                z_be_nonce = leading_zero_bits(hash_be[..32].try_into().unwrap()),
+                z_le_nonce = leading_zero_bits(h_le_be[..32].try_into().unwrap()),
+                job_id = m.job_id,
+                nonce = m.nonce,
+                en2 = %hex::encode(m.extranonce.as_ref()),
+                ntime = m.ntime,
+                version = m.version,
+                "FIRST REJECTED SHARE — full diagnostic dump"
+            );
+        }
+        let mut share_target_le = [0u8; 32];
+        share_target_le[26] = 0xff; // ~difficulty 256, LE (see channel open)
+        let share_target_be: Vec<u8> = share_target_le.iter().rev().copied().collect();
+        if hash_be.as_slice() > share_target_be.as_slice() {
+            // Byte-order forensics: hash the SAME nonce/ntime under the
+            // alternative merkle conventions. Whichever meets the share
+            // target is what the device actually hashed.
+            let alt_branch: Vec<[u8; 32]> = job
+                .merkle_branch
+                .iter()
+                .map(|n| {
+                    let mut r = *n;
+                    r.reverse();
+                    r
+                })
+                .collect();
+            let mut root_b = cb_txid;
+            for node in &alt_branch {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&root_b);
+                buf[32..].copy_from_slice(node);
+                root_b = Sha256d::hash(&buf).to_byte_array();
+            }
+            let mut header_b = Vec::with_capacity(80);
+            header_b.extend_from_slice(&m.version.to_le_bytes());
+            header_b.extend_from_slice(&job.prev_hash_internal);
+            header_b.extend_from_slice(&root_b);
+            header_b.extend_from_slice(&m.ntime.to_le_bytes());
+            header_b.extend_from_slice(&job.bits.to_le_bytes());
+            header_b.extend_from_slice(&m.nonce.to_le_bytes());
+            let hb_b = Sha256d::hash(&header_b).to_byte_array();
+            let hb_b_rev: Vec<u8> = hb_b.iter().rev().cloned().collect();
+            // Variant D/E: node++hash concat order (as-is / reversed nodes).
+            let climb_concat = |nodes: &[[u8; 32]], node_first: bool| {
+                let mut r = cb_txid;
+                for node in nodes {
+                    let mut buf = [0u8; 64];
+                    if node_first {
+                        buf[..32].copy_from_slice(node);
+                        buf[32..].copy_from_slice(&r);
+                    } else {
+                        buf[..32].copy_from_slice(&r);
+                        buf[32..].copy_from_slice(node);
+                    }
+                    r = Sha256d::hash(&buf).to_byte_array();
+                }
+                r
+            };
+            let mk_hdr = |root_bytes: &[u8; 32]| {
+                let mut h = Vec::with_capacity(80);
+                h.extend_from_slice(&m.version.to_le_bytes());
+                h.extend_from_slice(&job.prev_hash_internal);
+                h.extend_from_slice(root_bytes);
+                h.extend_from_slice(&m.ntime.to_le_bytes());
+                h.extend_from_slice(&job.bits.to_le_bytes());
+                h.extend_from_slice(&m.nonce.to_le_bytes());
+                h
+            };
+            let hb_d = Sha256d::hash(&mk_hdr(&climb_concat(&job.merkle_branch, true)))
+                .to_byte_array();
+            let hb_d_rev: Vec<u8> = hb_d.iter().rev().cloned().collect();
+            let hb_e = Sha256d::hash(&mk_hdr(&climb_concat(&alt_branch, true)))
+                .to_byte_array();
+            let hb_e_rev: Vec<u8> = hb_e.iter().rev().cloned().collect();
+            // Variant F: device received NO branch (root = coinbase txid).
+            let empty: [[u8; 32]; 0] = [];
+            let hb_f = Sha256d::hash(&mk_hdr(&climb_concat(&empty, false)))
+                .to_byte_array();
+            let hb_f_rev: Vec<u8> = hb_f.iter().rev().cloned().collect();
+            // Variants I-L: order/start-point axes. I: branch order reversed
+            // (shallowest-first climb). J: order+bytes reversed. K: climb
+            // starts from byte-REVERSED txid (BE txid on device). L: reversed
+            // txid + per-node-reversed branches.
+            let mut order_rev = job.merkle_branch.clone();
+            order_rev.reverse();
+            let mut both_rev = order_rev
+                .iter()
+                .map(|n| {
+                    let mut r = *n;
+                    r.reverse();
+                    r
+                })
+                .collect::<Vec<_>>();
+            let _ = &mut both_rev;
+            let mut txid_rev = cb_txid;
+            txid_rev.reverse();
+            let climb_from = |start: [u8; 32], nodes: &[[u8; 32]]| {
+                let mut r = start;
+                for node in nodes {
+                    let mut buf = [0u8; 64];
+                    buf[..32].copy_from_slice(&r);
+                    buf[32..].copy_from_slice(node);
+                    r = Sha256d::hash(&buf).to_byte_array();
+                }
+                r
+            };
+            let hb_i = Sha256d::hash(&mk_hdr(&climb_from(cb_txid, &order_rev)))
+                .to_byte_array();
+            let hb_i_rev: Vec<u8> = hb_i.iter().rev().cloned().collect();
+            let hb_j = Sha256d::hash(&mk_hdr(&climb_from(cb_txid, &both_rev)))
+                .to_byte_array();
+            let hb_j_rev: Vec<u8> = hb_j.iter().rev().cloned().collect();
+            let hb_k = Sha256d::hash(&mk_hdr(&climb_from(txid_rev, &job.merkle_branch)))
+                .to_byte_array();
+            let hb_k_rev: Vec<u8> = hb_k.iter().rev().cloned().collect();
+            let hb_l = Sha256d::hash(&mk_hdr(&climb_from(txid_rev, &alt_branch)))
+                .to_byte_array();
+            let hb_l_rev: Vec<u8> = hb_l.iter().rev().cloned().collect();
+            // Variant G: device climbed only the FIRST node (path truncated).
+            let first_only: Vec<[u8; 32]> = job.merkle_branch.iter().take(1).copied().collect();
+            let hb_g = Sha256d::hash(&mk_hdr(&climb_concat(&first_only, false)))
+                .to_byte_array();
+            let hb_g_rev: Vec<u8> = hb_g.iter().rev().cloned().collect();
+            // Variant C: pool's root, but reversed when written to header.
+            let mut root_rev = root.clone();
+            root_rev.reverse();
+            let mut header_c = header.clone();
+            header_c[36..68].copy_from_slice(&root_rev);
+            let hb_c = Sha256d::hash(&header_c).to_byte_array();
+            let hb_c_rev: Vec<u8> = hb_c.iter().rev().cloned().collect();
+            let meets = |h: &[u8]| h <= share_target_be.as_slice();
+            info!(
+                meets_as_is = meets(&hash_be),
+                meets_branch_rev = meets(&hb_b_rev),
+                meets_root_rev = meets(&hb_c_rev),
+                meets_concat_rev = meets(&hb_d_rev),
+                meets_concat_rev_nodes_rev = meets(&hb_e_rev),
+                meets_empty_branch = meets(&hb_f_rev),
+                meets_first_node_only = meets(&hb_g_rev),
+                meets_order_rev = meets(&hb_i_rev),
+                meets_order_and_bytes_rev = meets(&hb_j_rev),
+                meets_txid_be = meets(&hb_k_rev),
+                meets_txid_be_nodes_rev = meets(&hb_l_rev),
+                z_as_is = leading_zero_bits(hash_be[..32].try_into().unwrap()),
+                z_branch_rev = leading_zero_bits(hb_b_rev[..32].try_into().unwrap()),
+                z_concat_rev = leading_zero_bits(hb_d_rev[..32].try_into().unwrap()),
+                z_concat_rev_nodes_rev = leading_zero_bits(hb_e_rev[..32].try_into().unwrap()),
+                z_empty_branch = leading_zero_bits(hb_f_rev[..32].try_into().unwrap()),
+                z_first_node_only = leading_zero_bits(hb_g_rev[..32].try_into().unwrap()),
+                z_order_rev = leading_zero_bits(hb_i_rev[..32].try_into().unwrap()),
+                z_order_and_bytes_rev = leading_zero_bits(hb_j_rev[..32].try_into().unwrap()),
+                z_txid_be = leading_zero_bits(hb_k_rev[..32].try_into().unwrap()),
+                z_txid_be_nodes_rev = leading_zero_bits(hb_l_rev[..32].try_into().unwrap()),
+                branch_len = job.merkle_branch.len(),
+                "merkle-convention forensics"
+            );
+            let err = SubmitSharesError {
+                channel_id: m.channel_id,
+                sequence_number: m.sequence_number,
+                error_code: Str0255::try_from("difficulty-too-low".to_string())
+                    .map_err(|_| anyhow!("ec"))?,
+            };
+            let _ = out_tx
+                .send(MiningDeviceMessages::Mining(Mining::SubmitSharesError(err)))
+                .await;
+            return Ok(());
+        }
+    }
 
     // Best-share tracking: share difficulty = network_target / hash, both
     // big-endian, compared by their leading 64 bits (enough resolution;
@@ -782,8 +1018,19 @@ async fn handle_share(
         // d ≈ 2^(z-32). Power-of-two granularity is fine for display.
         let z = leading_zero_bits(hash_be[..32].try_into().unwrap());
         let d = 2f64.powi(z as i32 - 32);
+        debug!(z, d, hash_first4 = %hex::encode(&hash_be[..4]), hash_last4 = %hex::encode(&hash_be[28..]), "best-share calc");
+        let now = std::time::Instant::now();
         let mut st = state.lock().await;
         st.best_diff = st.best_diff.max(d);
+        st.share_times.push_back((now, d));
+        // Trim the window: 10 min of history covers the 5-min stats read
+        // with margin; the hard cap guards a pathological share flood.
+        while let Some((t, _)) = st.share_times.front() {
+            if now.duration_since(*t).as_secs() <= 600 && st.share_times.len() <= 8192 {
+                break;
+            }
+            st.share_times.pop_front();
+        }
     }
 
     if hash_be.as_slice() <= target_be.as_slice() {
@@ -881,11 +1128,25 @@ async fn serve_stats_http(
     let connected = st.device_connected;
     let conns = st.connections + n;
     let bits = st.active.as_ref().map(|j| j.bits);
-    let device_th = st.device_hashrate / 1e12;
+    // Share-derived hashrate over a 5-min window (ckpool hashmeter style):
+    // each share of difficulty d represents d*2^32 expected hashes.
+    let now = std::time::Instant::now();
+    let window_work: f64 = st
+        .share_times
+        .iter()
+        .filter(|(t, _)| now.duration_since(*t).as_secs() <= 300)
+        .map(|(_, d)| d)
+        .sum();
+    let derived_th = window_work * 2f64.powi(32) / 300.0 / 1e12;
+    let self_report_th = st.device_hashrate / 1e12;
+    let device_th = if derived_th > 0.0 { derived_th } else { self_report_th };
+    let hr_source = if derived_th > 0.0 { "shares(5m)" } else { "self-report" };
     drop(st);
 
-    // Device hashrate comes from its own SV2 UpdateChannel reports
-    // (nominal_hash_rate, hashes/s) -- authoritative, not share-derived.
+    // Hashrate shown is derived from accepted share work when available;
+    // falls back to the device's self-reported nominal_hash_rate (sampled
+    // at channel open, often seconds after boot and far too low) until
+    // enough shares accumulate.
 
     if path.starts_with("/stats") {
         let body = json!({
@@ -897,6 +1158,7 @@ async fn serve_stats_http(
             "shares": shares,
             "shares_per_sec": (shps * 100.0).round() / 100.0,
             "device_hashrate_th": (device_th * 100.0).round() / 100.0,
+            "hashrate_source": hr_source,
             "best_share_diff": if best.is_infinite() { json!("inf") } else { json!((best * 100.0).round() / 100.0) },
             "node_height": height,
             "network_nbits": bits.map(|b| format!("{b:08x}")),
