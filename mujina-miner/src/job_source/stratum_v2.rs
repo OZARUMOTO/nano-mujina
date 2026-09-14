@@ -90,9 +90,78 @@ use super::{
 static SV2_SHARES_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static SV2_SHARES_REJECTED: AtomicU64 = AtomicU64::new(0);
 
+/// Shares dropped by the device-side rate limiter since process start.
+/// A nonzero value means the pool's share target is too easy for this
+/// hashrate (the device protects itself; consider a higher-difficulty pool).
+pub fn sv2_share_dropped_count() -> u64 {
+    SV2_SHARES_DROPPED.load(Ordering::Relaxed)
+}
+
 /// Monotonic sequence counter for SubmitSharesExtended (per process; the
 /// protocol requires it to increase within the channel).
 static SUBMIT_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+/// Shares dropped by the device-side rate limiter (see `share_throttle`).
+static SV2_SHARES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Device-side share-rate ceiling: a token bucket applied to every
+/// outgoing `SubmitSharesExtended` regardless of the pool's target.
+/// A pool that sets an absurdly easy share target (difficulty ~1 is a
+/// 1-in-4-billion hash) can otherwise flood the little core -- which
+/// also serves the dashboard API, LCD and RTOS IPC -- with hundreds of
+/// SV2 messages per second and wedge it (found live 2026-09-14: the
+/// board froze with a difficulty-1 pool, API unresponsive, share path
+/// stalled). The bucket allows bursts and ~20 shares/s sustained;
+/// anything beyond is dropped without a log storm. Shares rejected this
+/// way are statistically worthless by construction, and a block-caliber
+/// hash (network target) is unaffected: it is ~2^68 times rarer than a
+/// diff-256 share, so the throttle can never eat a real block.
+struct TokenBucket {
+    tokens: f64,
+    last: std::time::Instant,
+    capacity: f64,
+    refill_per_sec: f64,
+}
+
+impl TokenBucket {
+    fn new(capacity: u32, refill_per_sec: f64) -> Self {
+        Self {
+            tokens: capacity as f64,
+            last: std::time::Instant::now(),
+            capacity: capacity as f64,
+            refill_per_sec,
+        }
+    }
+
+    /// `true` = take a token and proceed; `false` = rate-limited, drop.
+    fn try_acquire(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.refill_per_sec).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Shared bucket (survives reconnects; the connection task is its only
+/// consumer, so the brief lock is uncontended in practice).
+fn share_throttle() -> &'static std::sync::Mutex<TokenBucket> {
+    static T: std::sync::OnceLock<std::sync::Mutex<TokenBucket>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(TokenBucket::new(40, 20.0)))
+}
+
+/// Gate for "share rejected" warns: at most one every 30s so a hostile
+/// pool can't turn the log into its own denial of service.
+fn reject_warn_gate() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static G: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(None))
+}
 
 /// SV2 pool accept/reject totals since this process started.
 pub fn sv2_share_accept_reject_counts() -> (u64, u64) {
@@ -370,10 +439,16 @@ impl StratumV2Source {
                 cmd = self.command_rx.recv() => {
                     match cmd {
                         Some(SourceCommand::SubmitShare(share)) => {
-                            if let Err(e) = submit_share(&sender, &session, share).await {
-                                // A failed submit is logged; the connection
-                                // stays up unless the transport is dead.
-                                error!(error = %e, "SV2: share submit failed");
+                            // Device-side hard ceiling (see `share_throttle`):
+                            // survives a pool with an absurdly easy target.
+                            if share_throttle().lock().unwrap().try_acquire() {
+                                if let Err(e) = submit_share(&sender, &session, share).await {
+                                    // A failed submit is logged; the connection
+                                    // stays up unless the transport is dead.
+                                    error!(error = %e, "SV2: share submit failed");
+                                }
+                            } else {
+                                SV2_SHARES_DROPPED.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Some(SourceCommand::UpdateHashRate(rate)) => {
@@ -519,10 +594,24 @@ impl StratumV2Source {
                         }
                         MiningDeviceMessages::Mining(Mining::SubmitSharesError(m)) => {
                             SV2_SHARES_REJECTED.fetch_add(1, Ordering::Relaxed);
-                            warn!(
-                                error = %m.error_code.as_utf8_or_hex(),
-                                "SV2: share rejected"
-                            );
+                            // Rate-limited warn: never more than one line
+                            // per 30s (a flood of rejections must not cost
+                            // us the log/dashboards too).
+                            let should_log = {
+                                let mut g = reject_warn_gate().lock().unwrap();
+                                let now = std::time::Instant::now();
+                                let due = g.map(|t| now.duration_since(t).as_secs() >= 30).unwrap_or(true);
+                                if due {
+                                    *g = Some(now);
+                                }
+                                due
+                            };
+                            if should_log {
+                                warn!(
+                                    error = %m.error_code.as_utf8_or_hex(),
+                                    "SV2: share rejected (further warns rate-limited to 1/30s)"
+                                );
+                            }
                         }
                         MiningDeviceMessages::Mining(Mining::CloseChannel(m)) => {
                             return Err(anyhow!(

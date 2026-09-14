@@ -62,6 +62,8 @@ struct Config {
     rpc_user: String,
     rpc_pass: String,
     payout_pkh: [u8; 20],
+    /// Original payout address (display in the status panel)
+    payout: String,
     worker_tag: Vec<u8>,
     extranonce_base: Vec<u8>,
 }
@@ -76,6 +78,7 @@ impl Config {
             rpc_user: std::env::var("NP_USER").unwrap_or_else(|_| "mujina".into()),
             rpc_pass: std::env::var("NP_PASS").context("NP_PASS required")?,
             payout_pkh: decode_payout(&payout)?,
+            payout,
             worker_tag: std::env::var("NP_WORKER_TAG")
                 .unwrap_or_else(|_| "OPNANO".into())
                 .into_bytes(),
@@ -341,6 +344,22 @@ struct PoolState {
     active: Option<ActiveJob>,
     shares_ok: u64,
     last_prev: String,
+    // ---- solo-stats panel (served on NP_STATS_PORT) ----
+    started: std::time::Instant,
+    /// best share seen, as difficulty units (hash_target / hash)
+    best_diff: f64,
+    /// true when a block hash beat the network target this session
+    block_found: bool,
+    /// node's verdict on the last submitted block (null = accepted)
+    last_block_result: String,
+    /// last accepted-block height fed to the device
+    node_height: u64,
+    /// device's self-reported hashrate (SV2 nominal_hash_rate, hashes/s)
+    device_hashrate: f64,
+    /// SV2 connections since start (device auto-reconnects; count them)
+    connections: u64,
+    /// currently connected (set in setup handler)
+    device_connected: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -362,8 +381,28 @@ async fn main() -> Result<()> {
         active: None,
         shares_ok: 0,
         last_prev: String::new(),
+        started: std::time::Instant::now(),
+        best_diff: 0.0,
+        block_found: false,
+        last_block_result: "none yet".into(),
+        node_height: 0,
+        device_hashrate: 0.0,
+        connections: 0,
+        device_connected: false,
     }));
     let (job_tx, _) = broadcast::channel::<Outgoing>(16);
+
+    // Solo-stats panel: tiny HTTP server (JSON at /stats, HTML at /).
+    let stats_state = state.clone();
+    let stats_port: u16 = std::env::var("NP_STATS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3335);
+    tokio::spawn(async move {
+        if let Err(e) = stats_server(stats_port, stats_state).await {
+            error!("stats server: {e:#}");
+        }
+    });
 
     // Template refresher: poll GBT-Light. Only rotate the downstream job
     // when the node's template actually CHANGED (its job_id is
@@ -403,6 +442,7 @@ async fn main() -> Result<()> {
                         job.extranonce_prefix = prefix;
                         let (mut j, ph) = to_sv2_messages(&job);
                         if new_tip {
+                            st.node_height = tpl.height;
                             info!(height = tpl.height, prev = %tpl.prev_hash, "new template (new tip)");
                             let _ = job_tx.send(Outgoing::Job(j));
                             let _ = job_tx.send(Outgoing::PrevHash(ph));
@@ -496,6 +536,7 @@ async fn handle_downstream(
     )
     .await
     .map_err(|e| anyhow!("noise handshake: {e:?}"))?;
+    state.lock().await.connections += 1;
     info!("device connected (Noise OK)");
     let (mut reader, mut writer) = noise.into_split();
 
@@ -569,6 +610,7 @@ async fn handle_downstream(
                             warn!("device did not declare extended-channel support; continuing");
                         }
                         setup_done = true;
+                        state.lock().await.device_connected = true;
                         let _ = out_tx
                             .send(MiningDeviceMessages::Common(CommonMessages::SetupConnectionSuccess(
                                 SetupConnectionSuccess { used_version: 2, flags: 0 },
@@ -587,14 +629,22 @@ async fn handle_downstream(
                             return Err(anyhow!("open before setup"));
                         }
                         let target: [u8; 32] = {
-                            // ~difficulty 1 (2^224-ish): solo pool only
-                            // cares about block-finding, but a stream of
-                            // easy shares gives the dashboard live stats
-                            // (~1-5 shares/s at 6 TH/s). Bytes land at
-                            // [26..28] so the device's little-endian parse
-                            // sees the same magnitude.
+                            // ~difficulty 256: shares are only a stats
+                            // feed here (solo pool banks nothing), and at
+                            // 6 TH/s difficulty-1 flooded the device's
+                            // little core with hundreds of SV2 messages
+                            // per second -- it starved the dashboard API
+                            // and LCD (found live 2026-09-14). ~0.7
+                            // shares/s at 6 TH/s is plenty.
+                            //
+                            // Byte order: the device reads this U256 as
+                            // LITTLE-endian, so byte i weighs 2^(8i).
+                            // Diff-1 target ≈ 2^224 (bytes 26..28 set);
+                            // diff-256 = diff1/2^8 ≈ 2^216 → byte 26
+                            // only. (Setting MORE bytes makes the target
+                            // EASIER -- that mistake briefly took us to
+                            // diff ~0.75 and a 180/s flood.)
                             let mut t = [0u8; 32];
-                            t[27] = 0xff;
                             t[26] = 0xff;
                             t
                         };
@@ -618,6 +668,7 @@ async fn handle_downstream(
                         // latch prefix onto the active job for share checks
                         {
                             let mut st = state.lock().await;
+                            st.device_hashrate = m.nominal_hash_rate as f64;
                             if let Some(job) = st.active.as_mut() {
                                 job.extranonce_prefix = prefix;
                                 job.extranonce_size = extranonce_size;
@@ -652,6 +703,7 @@ async fn handle_downstream(
                         }
                     }
                     MiningDeviceMessages::Mining(Mining::UpdateChannel(m)) => {
+                        state.lock().await.device_hashrate = m.nominal_hash_rate as f64;
                         debug!(nominal = m.nominal_hash_rate, "update_channel (solo: target fixed)");
                     }
                     other => {
@@ -720,6 +772,20 @@ async fn handle_share(
     let hash_be: Vec<u8> = hash_le.iter().rev().cloned().collect();
     let target_be = bits_to_target_be(job.bits);
 
+    // Best-share tracking: share difficulty = network_target / hash, both
+    // big-endian, compared by their leading 64 bits (enough resolution;
+    // avoids bignum math).
+    {
+        // Best-share tracking in standard difficulty units: d =
+        // diff1_target / hash over full 256-bit values. diff1 ≈ 2^224 has
+        // 32 leading zero bits; a hash worth 2^(256-z) therefore has
+        // d ≈ 2^(z-32). Power-of-two granularity is fine for display.
+        let z = leading_zero_bits(hash_be[..32].try_into().unwrap());
+        let d = 2f64.powi(z as i32 - 32);
+        let mut st = state.lock().await;
+        st.best_diff = st.best_diff.max(d);
+    }
+
     if hash_be.as_slice() <= target_be.as_slice() {
         // *** SOLO BLOCK CANDIDATE ***
         let mut block = header.clone();
@@ -727,16 +793,25 @@ async fn handle_share(
         block.extend_from_slice(&coinbase);
         let block_hex = hex::encode(block);
         info!(height = job.height, "*** BLOCK CANDIDATE *** submitting to node");
-        let st = state.lock().await;
-        match rpc(&st.cfg, "submitblocklight", json!([block_hex, job.node_job_id])).await {
+        {
+            let mut st = state.lock().await;
+            st.block_found = true;
+        }
+        let cfg = state.lock().await.cfg.clone();
+        match rpc(&cfg, "submitblocklight", json!([block_hex, job.node_job_id])).await {
             Ok(v) => {
                 if v.is_null() {
                     error!(height = job.height, "*** BLOCK ACCEPTED — SOLO BLOCK! ***");
+                    state.lock().await.last_block_result = "ACCEPTED 🎉".into();
                 } else {
                     warn!(height = job.height, resp = %v, "block rejected by node");
+                    state.lock().await.last_block_result = format!("rejected: {v}");
                 }
             }
-            Err(e) => error!("block submit failed: {e:#}"),
+            Err(e) => {
+                error!("block submit failed: {e:#}");
+                state.lock().await.last_block_result = format!("submit failed: {e:#}");
+            }
         }
     }
 
@@ -745,7 +820,7 @@ async fn handle_share(
         let mut st = state.lock().await;
         st.shares_ok += 1;
         let n = st.shares_ok;
-        if n % 10 == 0 {
+        if n % 1000 == 0 {
             info!(shares = n, "progress");
         }
     }
@@ -760,6 +835,193 @@ async fn handle_share(
         .send(MiningDeviceMessages::Mining(Mining::SubmitSharesSuccess(resp)))
         .await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Solo-stats panel (http://<mac>:3335/)
+// ---------------------------------------------------------------------------
+
+async fn stats_server(port: u16, state: Arc<AMutex<PoolState>>) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+    static CONN: AtomicU64 = AtomicU64::new(0);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    info!(port, "solo-stats panel listening (open http://<mac>:{port}/)");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = state.clone();
+        CONN.fetch_add(1, AOrd::Relaxed);
+        let n = CONN.load(AOrd::Relaxed);
+        tokio::spawn(async move {
+            let _ = serve_stats_http(stream, state, n).await;
+        });
+    }
+}
+
+async fn serve_stats_http(
+    stream: TcpStream,
+    state: Arc<AMutex<PoolState>>,
+    n: u64,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut rd, mut wr) = stream.into_split();
+    let mut buf = [0u8; 2048];
+    let _ = rd.read(&mut buf).await;
+    let req = String::from_utf8_lossy(&buf);
+    let path = req.split_whitespace().nth(1).unwrap_or("/");
+
+    let st = state.lock().await;
+    let secs = st.started.elapsed().as_secs();
+    let (days, hrs, mins) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    let shares = st.shares_ok;
+    let shps = if secs > 0 { shares as f64 / secs as f64 } else { 0.0 };
+    let best = st.best_diff;
+    let height = st.node_height;
+    let payout = st.cfg.payout.clone();
+    let (block_found, block_result) = (st.block_found, st.last_block_result.clone());
+    let connected = st.device_connected;
+    let conns = st.connections + n;
+    let bits = st.active.as_ref().map(|j| j.bits);
+    let device_th = st.device_hashrate / 1e12;
+    drop(st);
+
+    // Device hashrate comes from its own SV2 UpdateChannel reports
+    // (nominal_hash_rate, hashes/s) -- authoritative, not share-derived.
+
+    if path.starts_with("/stats") {
+        let body = json!({
+            "mode": "solo BCH via local BCHN (GBT-Light) over Stratum V2",
+            "payout": payout,
+            "device_connected": connected,
+            "connections_total": conns,
+            "uptime_secs": secs,
+            "shares": shares,
+            "shares_per_sec": (shps * 100.0).round() / 100.0,
+            "device_hashrate_th": (device_th * 100.0).round() / 100.0,
+            "best_share_diff": if best.is_infinite() { json!("inf") } else { json!((best * 100.0).round() / 100.0) },
+            "node_height": height,
+            "network_nbits": bits.map(|b| format!("{b:08x}")),
+            "block_found": block_found,
+            "last_block_result": block_result,
+        });
+        let body = body.to_string();
+        wr.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        ).await?;
+        return Ok(());
+    }
+
+    let banner = if block_found {
+        format!("BLOCK CANDIDATE THIS SESSION — {}", block_result)
+    } else {
+        "no block yet — every share is checked against the network target".into()
+    };
+    let connected_html = if connected {
+        "<span class=ok>connected</span>"
+    } else {
+        "<span class=bad>NOT connected — check miner settings</span>"
+    };
+    let html = format!(
+        r#"<!doctype html><html><head><meta charset=utf-8><title>nano-pool solo status</title>
+<style>
+body{{font-family:-apple-system,system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:2rem;max-width:760px;margin-inline:auto}}
+h1{{font-size:1.3rem;margin:0 0 .2em}}
+.sub{{color:#8b949e;font-size:.85rem;margin-bottom:1.5rem}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.8rem}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:.9rem 1.1rem}}
+.k{{color:#8b949e;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em}}
+.v{{font-size:1.45rem;font-weight:600;margin-top:.25rem;font-variant-numeric:tabular-nums}}
+.big .v{{font-size:2rem;color:#58a6ff}}
+.ok{{color:#3fb950}}.bad{{color:#f85149}}
+.banner{{margin-top:1.2rem;padding:.8rem 1rem;border-radius:10px;background:#161b22;border:1px solid #30363d;color:#d29922;font-size:.9rem}}
+.note{{color:#8b949e;font-size:.78rem;margin-top:1.4rem;line-height:1.5}}
+code{{background:#161b22;padding:.1em .35em;border-radius:4px}}
+</style></head><body>
+<h1>nano-pool — solo BCH</h1>
+<div class=sub>Stratum V2 pool → local BCHN (GBT-Light) → solo block submit</div>
+<div class=grid>
+<div class="card big"><div class=k>Shares</div><div class=v id=shares>{}</div></div>
+<div class="card big"><div class=k>Best share (difficulty)</div><div class=v id=best>{:.2}</div></div>
+<div class=card><div class=k>Device hashrate (self-reported)</div><div class=v id=hr>{:.2} TH/s</div></div>
+<div class=card><div class=k>Device</div><div class=v>{}</div></div>
+<div class=card><div class=k>Uptime</div><div class=v>{}d {:02}h {:02}m</div></div>
+<div class=card><div class=k>Node height</div><div class=v id=height>{}</div></div>
+<div class=card><div class=k>Network nbits</div><div class=v>{}</div></div>
+<div class=card><div class=k>Connections (total)</div><div class=v>{}</div></div>
+</div>
+<div class=banner id=banner>{}</div>
+<div class=note>
+Share difficulty is ~256 (stats feed only — one share per ~2^40 hashes).
+The <b>block</b> check runs on every share against the real BCH network target
+(nbits above): {} ≈ 1 in {:.0} per hash. Expected solo block interval at this
+hashrate: months. Payout: <code>{}</code><br>
+JSON: <code>/stats</code> — refreshes every 5s.
+</div>
+<script>
+const fmt=n=>n.toLocaleString();
+setInterval(async()=>{{
+ try{{
+  const s=await(await fetch('/stats')).json();
+  shares.textContent=fmt(s.shares); hr.textContent=s.device_hashrate_th+' TH/s';
+  best.textContent=(s.best_share_diff==="inf"?'∞':s.best_share_diff);
+  height.textContent=fmt(s.node_height);
+ }}catch(e){{}}
+}},5000);
+</script>
+</body></html>"#,
+        shares,
+        if best.is_infinite() { f64::INFINITY } else { best },
+        device_th,
+        connected_html,
+        days, hrs, mins,
+        height,
+        bits.map(|b| format!("{b:08x}")).unwrap_or_else(|| "—".into()),
+        conns,
+        banner,
+        bits.map(|b| format!("0x{b:08x}")).unwrap_or_else(|| "—".into()),
+        {
+            // difficulty from nbits for the note line
+            match bits {
+                Some(b) => {
+                    let t = bits_to_target_be(b);
+                    let t_top = u64::from_be_bytes(t[..8].try_into().unwrap());
+                    // diff1_target / network_target, top-64-bit approximation
+                    let d1: u64 = 0x0000_0000_ffff_0000;
+                    if t_top == 0 { f64::INFINITY } else { (d1 as f64) / (t_top as f64) * 65536.0 }
+                }
+                None => 0.0,
+            }
+        },
+        payout,
+    );
+    wr.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(),
+            html
+        )
+        .as_bytes(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Count leading zero bits of a big-endian 32-byte hash.
+fn leading_zero_bits(be: &[u8; 32]) -> u32 {
+    let mut z: u32 = 0;
+    for &b in be {
+        if b == 0 {
+            z += 8;
+        } else {
+            z += b.leading_zeros();
+            break;
+        }
+    }
+    z
 }
 
 /// bitcoin compact `bits` -> 32-byte big-endian target.
