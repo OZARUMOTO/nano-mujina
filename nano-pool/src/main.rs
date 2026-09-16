@@ -14,7 +14,10 @@
 //!   NP_RPC      node RPC url           (default http://127.0.0.1:18443)
 //!   NP_USER     node RPC user          (default mujina)
 //!   NP_PASS     node RPC password      (required)
-//!   NP_PAYOUT   BCH address for block rewards (required)
+//!   NP_PAYOUT   payout address for block rewards (required): BCH cashaddr
+//!               or legacy base58 P2PKH (DigiByte 0x1e / BTC 0x00)
+//!   NP_NODE     node flavor: "bchn" (GBT-Light, default) or "digibyte"
+//!               (standard GBT — merkle branch computed from tx list)
 //!   NP_WORKER_TAG  coinbase tag        (default OPNANO)
 
 use anyhow::{anyhow, Context, Result};
@@ -134,6 +137,9 @@ struct Config {
     rpc_url: String,
     rpc_user: String,
     rpc_pass: String,
+    /// true = BCHN getblocktemplatelight (default); false = standard
+    /// Bitcoin-Core getblocktemplate (DigiByte)
+    gbt_light: bool,
     payout_pkh: [u8; 20],
     /// Original payout address (display in the status panel)
     payout: String,
@@ -150,6 +156,9 @@ impl Config {
             rpc_url: std::env::var("NP_RPC").unwrap_or_else(|_| "http://127.0.0.1:18443".into()),
             rpc_user: std::env::var("NP_USER").unwrap_or_else(|_| "mujina".into()),
             rpc_pass: std::env::var("NP_PASS").context("NP_PASS required")?,
+            gbt_light: std::env::var("NP_NODE")
+                .unwrap_or_else(|_| "bchn".into())
+                .eq_ignore_ascii_case("bchn"),
             payout_pkh: decode_payout(&payout)?,
             payout,
             worker_tag: std::env::var("NP_WORKER_TAG")
@@ -162,15 +171,64 @@ impl Config {
     }
 }
 
-/// Decode a BCH cashaddr (with or without `prefix:`) into its 20-byte
-/// payload hash. Legacy base58 addresses are not supported (use cashaddr).
+/// Decode a payout address into its 20-byte payload hash. Supports BCH
+/// cashaddr (with or without `prefix:`) and legacy base58check P2PKH
+/// (DigiByte version byte 0x1e, Bitcoin 0x00). Cashaddr checksums are
+/// strong, so try cashaddr first and fall back to base58.
 fn decode_payout(addr: &str) -> Result<[u8; 20]> {
     let a = addr.trim();
     if let Some(colon) = a.find(':') {
         let (hrp, rest) = a.split_at(colon);
         return cashaddr_decode(hrp, &rest[1..]);
     }
-    cashaddr_decode("bitcoincash", a).or_else(|_| cashaddr_decode("bchreg", a))
+    cashaddr_decode("bitcoincash", a)
+        .or_else(|_| cashaddr_decode("bchreg", a))
+        .or_else(|_| base58check_pkh(a))
+}
+
+/// Legacy base58check P2PKH: 1 version byte + 20-byte hash160 + 4-byte
+/// double-SHA256 checksum.
+fn base58check_pkh(addr: &str) -> Result<[u8; 20]> {
+    const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut num: Vec<u8> = Vec::new(); // big-endian base-256 accumulator
+    for c in addr.bytes() {
+        let d = B58
+            .iter()
+            .position(|&x| x == c)
+            .ok_or_else(|| anyhow!("bad base58 char '{c}'"))? as u32;
+        let mut carry = d;
+        for b in num.iter_mut().rev() {
+            let v = (*b as u32) * 58 + carry;
+            *b = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        while carry > 0 {
+            num.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    // each leading '1' encodes a leading zero byte
+    let mut raw = vec![0u8; addr.bytes().take_while(|&c| c == b'1').count()];
+    raw.extend_from_slice(&num);
+    if raw.len() != 25 {
+        return Err(anyhow!(
+            "base58 payload must be 25 bytes, got {}",
+            raw.len()
+        ));
+    }
+    let (payload, check) = raw.split_at(21);
+    let sum = Sha256d::hash(payload).to_byte_array();
+    if sum[..4] != *check {
+        return Err(anyhow!("base58 checksum mismatch"));
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&payload[1..21]);
+    match payload[0] {
+        0x00 | 0x1e => Ok(out),
+        v => Err(anyhow!(
+            "unsupported base58 version {v:#04x} — need P2PKH (DGB 0x1e / BTC 0x00)"
+        )),
+    }
 }
 
 /// Minimal cashaddr decoder (BCH checksum, 5-bit groups; payload is
@@ -264,6 +322,65 @@ mod tests {
             .expect("regtest address decodes");
         assert_eq!(pkh, hex::decode("f19b15c0e940ee37109f529344c516081801fe5a").unwrap()[..20]);
     }
+
+    #[test]
+    fn base58_dgb_p2pkh() {
+        // validated against digibyte-cli validateaddress
+        let pkh = decode_payout("D76edx2imfErFaHrh5fFwWNVKgWfojh2sa")
+            .expect("DGB address decodes");
+        assert_eq!(
+            hex::encode(pkh),
+            "1579cc3fa8bb09da123433aa26b79fd3159b4a86"
+        );
+        // and a legacy BTC address must still decode (version 0x00)
+        assert!(decode_payout("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").is_ok());
+        // bad checksum must be rejected
+        assert!(decode_payout("D76edx2imfErFaHrh5fFwWNVKgWfojh2sb").is_err());
+    }
+
+    #[test]
+    fn coinbase_merkle_branch_golden() {
+        // 3 txs, odd level duplicates its last node; branch = [b, H(c,c)]
+        let a = int_leaf(1);
+        let b = int_leaf(2);
+        let c = int_leaf(3);
+        let mut cc = [0u8; 32];
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&c);
+        buf[32..].copy_from_slice(&c);
+        cc.copy_from_slice(Sha256d::hash(&buf).to_byte_array().as_ref());
+        let got = coinbase_merkle_branch(&[a, b, c]);
+        assert_eq!(got, vec![b, cc]);
+        // the branch must reconstruct the merkle root from the coinbase txid
+        let mut buf2 = [0u8; 64];
+        buf2[..32].copy_from_slice(&a);
+        buf2[32..].copy_from_slice(&b);
+        let ab = Sha256d::hash(&buf2).to_byte_array();
+        let mut buf3 = [0u8; 64];
+        buf3[..32].copy_from_slice(&ab);
+        buf3[32..].copy_from_slice(&cc);
+        let root = Sha256d::hash(&buf3).to_byte_array();
+        assert_eq!(
+            hex::encode(root),
+            "6a0d809efdf8c4436bc8f524f88e2dbbeed17b2588bec857f14924c684b5ffe9"
+        );
+        // single tx: branch empty, root = H(a,a)
+        assert!(coinbase_merkle_branch(&[a]).is_empty());
+        let mut buf4 = [0u8; 64];
+        buf4[..32].copy_from_slice(&a);
+        buf4[32..].copy_from_slice(&a);
+        assert_eq!(
+            hex::encode(Sha256d::hash(&buf4).to_byte_array()),
+            "95b224987a97df8d0f91d3219f601696798a9ad719ede30b265628584fe7f17d"
+        );
+    }
+
+    /// leaf with first byte = n (rest zero), in internal order
+    fn int_leaf(n: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        b
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +397,11 @@ struct NodeTemplate {
     coinbase_value: u64,
     bits: u32,
     min_ntime: u32,
+    /// block version from the node, forwarded verbatim (DigiByte encodes
+    /// the PoW algo in version bits 8-11, sha256d = 0x0200; BCHN's is the
+    /// canonical 0x20000000). Never hardcode — wrong algo bits make the
+    /// node read the block as another algorithm's (invalid PoW).
+    version: u32,
 }
 
 async fn rpc(cfg: &Config, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
@@ -302,6 +424,16 @@ async fn rpc(cfg: &Config, method: &str, params: serde_json::Value) -> Result<se
 }
 
 async fn fetch_template(cfg: &Config) -> Result<NodeTemplate> {
+    if cfg.gbt_light {
+        fetch_template_light(cfg).await
+    } else {
+        fetch_template_std(cfg).await
+    }
+}
+
+/// BCHN getblocktemplatelight: content-derived job_id + precomputed merkle
+/// branch (hex, display order).
+async fn fetch_template_light(cfg: &Config) -> Result<NodeTemplate> {
     let t = rpc(cfg, "getblocktemplatelight", json!([])).await?;
     let branch = t["merkle"]
         .as_array()
@@ -323,7 +455,102 @@ async fn fetch_template(cfg: &Config) -> Result<NodeTemplate> {
         coinbase_value: t["coinbasevalue"].as_u64().context("no value")?,
         bits: u32::from_str_radix(t["bits"].as_str().context("no bits")?, 16)?,
         min_ntime: t["mintime"].as_u64().unwrap_or(0) as u32,
+        version: t["version"].as_i64().unwrap_or(0x2000_0000) as u32,
     })
+}
+
+/// Standard Bitcoin-Core getblocktemplate (DigiByte): no job_id, no merkle
+/// branch — the pool derives both from the transaction list itself. The
+/// template version is forwarded verbatim (the node's `-algo` selects the
+/// PoW algorithm whose bits land in the version).
+async fn fetch_template_std(cfg: &Config) -> Result<NodeTemplate> {
+    let t = rpc(cfg, "getblocktemplate", json!([{"rules": []}])).await?;
+    let height = t["height"].as_u64().context("no height")?;
+    let prev_hash: BlockHash = t["previousblockhash"].as_str().context("no prev")?.parse()?;
+    let bits = u32::from_str_radix(t["bits"].as_str().context("no bits")?, 16)?;
+    let version = t["version"].as_i64().context("no version")? as u32;
+    let coinbase_value = t["coinbasevalue"].as_u64().context("no value")?;
+    let mintime = t["mintime"].as_u64().unwrap_or(0) as u32;
+
+    // txids arrive in display (block-hash) order; the climb runs in
+    // internal order, so reverse each.
+    let txs = t["transactions"].as_array().context("no transactions")?;
+    let mut ids: Vec<[u8; 32]> = Vec::with_capacity(txs.len());
+    for tx in txs {
+        let s = tx["txid"].as_str().context("no txid")?;
+        let mut b = [0u8; 32];
+        hex::decode_to_slice(s, &mut b)?;
+        b.reverse();
+        ids.push(b);
+    }
+    let mut branch = coinbase_merkle_branch(&ids);
+    for n in branch.iter_mut() {
+        n.reverse(); // store display-order nodes, like the light path
+    }
+    // Content-derived job id: changes iff the effective template changes
+    // (tip, version, bits, fees/mempool). Merkle-shaped fingerprint over
+    // the sibling txids — an empty mempool folds to zero. min_ntime is
+    // deliberately excluded so polls don't churn job ids.
+    let root = merkle_digest(&ids);
+    let mut id_src = Vec::with_capacity(32 + 4 + 4 + 8 + 32);
+    id_src.extend_from_slice(prev_hash.as_raw_hash().as_byte_array());
+    id_src.extend_from_slice(&version.to_le_bytes());
+    id_src.extend_from_slice(&bits.to_le_bytes());
+    id_src.extend_from_slice(&coinbase_value.to_le_bytes());
+    id_src.extend_from_slice(&root);
+    Ok(NodeTemplate {
+        job_id: hex::encode(Sha256d::hash(&id_src).to_byte_array()),
+        height,
+        prev_hash,
+        merkle_branch: branch,
+        coinbase_value,
+        bits,
+        min_ntime: mintime,
+        version,
+    })
+}
+
+/// Coinbase's merkle branch from sibling txids (internal order), following
+/// the node's TransactionMerkleTree: odd levels duplicate their last node.
+fn coinbase_merkle_branch(ids: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut branch = Vec::new();
+    let mut level: Vec<[u8; 32]> = ids.to_vec();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for p in level.chunks(2) {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&p[0]);
+            buf[32..].copy_from_slice(&p[1]);
+            next.push(Sha256d::hash(&buf).to_byte_array());
+        }
+        branch.push(level[1]); // sibling of the leftmost (coinbase) node
+        level = next;
+    }
+    branch
+}
+
+/// Root-shaped fold over sibling txids — a template fingerprint, not the
+/// block merkle root (the coinbase txid isn't known at template time).
+fn merkle_digest(ids: &[[u8; 32]]) -> [u8; 32] {
+    let mut level: Vec<[u8; 32]> = ids.to_vec();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        level = level
+            .chunks(2)
+            .map(|p| {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&p[0]);
+                buf[32..].copy_from_slice(&p[1]);
+                Sha256d::hash(&buf).to_byte_array()
+            })
+            .collect();
+    }
+    level.first().copied().unwrap_or([0u8; 32])
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +809,7 @@ fn make_job(tpl: &NodeTemplate, cfg: &Config, sv2_id: u32) -> ActiveJob {
     ActiveJob {
         sv2_job_id: sv2_id,
         node_job_id: tpl.job_id.clone(),
-        version: 0x2000_0000,
+        version: tpl.version,
         merkle_branch: tpl.merkle_branch.clone(),
         coinbase: build_coinbase(tpl, cfg),
         extranonce_prefix: Vec::new(),
