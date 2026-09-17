@@ -2,6 +2,9 @@ Cargo.lock
 /target/
 /.cache/
 
+# discord webhook secret (read by nano-pool)
+.pool-webhook
+
 # kdimg pipeline work directory (build_kdimg.sh)
 /build/
 

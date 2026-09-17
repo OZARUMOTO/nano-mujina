@@ -19,6 +19,8 @@
 //!   NP_NODE     node flavor: "bchn" (GBT-Light, default) or "digibyte"
 //!               (standard GBT — merkle branch computed from tx list)
 //!   NP_WORKER_TAG  coinbase tag        (default OPNANO)
+//!   NP_DISCORD_WEBHOOK  discord webhook url (or repo file `.pool-webhook`)
+//!   NP_COIN_LABEL   label in notification footers (default BCH)
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin::hashes::sha256d::Hash as Sha256d;
@@ -1329,7 +1331,27 @@ async fn handle_share(
         debug!(z, d, hash_first4 = %hex::encode(&hash_be[..4]), hash_last4 = %hex::encode(&hash_be[28..]), "best-share calc");
         let now = std::time::Instant::now();
         let mut st = state.lock().await;
-        st.best_diff = st.best_diff.max(d);
+        if d > st.best_diff {
+            st.best_diff = d;
+            // Pretty-print: 65536 -> "65.5k", 4194304 -> "4.2M"
+            let pretty = if d >= 1e12 {
+                format!("{:.1}T", d / 1e12)
+            } else if d >= 1e9 {
+                format!("{:.1}B", d / 1e9)
+            } else if d >= 1e6 {
+                format!("{:.1}M", d / 1e6)
+            } else if d >= 1e3 {
+                format!("{:.1}k", d / 1e3)
+            } else {
+                format!("{d:.2}")
+            };
+            discord_notify(
+                "best",
+                "📈 New best share",
+                vec![("Difficulty", pretty), ("Zero bits", format!("{z}"))],
+                0x3498db,
+            );
+        }
         st.share_times.push_back((now, d));
         // Trim the window: 10 min of history covers the 5-min stats read
         // with margin; the hard cap guards a pathological share flood.
@@ -1408,6 +1430,15 @@ async fn handle_share(
         block.extend_from_slice(&coinbase);
         let block_hex = hex::encode(block);
         info!(height = job.height, "*** BLOCK CANDIDATE *** submitting to node");
+        discord_notify(
+            "candidate",
+            "⛏️ BLOCK CANDIDATE FOUND",
+            vec![
+                ("Height", job.height.to_string()),
+                ("Status", "Submitting to node…".into()),
+            ],
+            0xe67e22,
+        );
         {
             let mut st = state.lock().await;
             st.block_found = true;
@@ -1418,14 +1449,38 @@ async fn handle_share(
                 if v.is_null() {
                     error!(height = job.height, "*** BLOCK ACCEPTED — SOLO BLOCK! ***");
                     state.lock().await.last_block_result = "ACCEPTED 🎉".into();
+                    discord_notify(
+                        "accepted",
+                        "🎉 SOLO BLOCK ACCEPTED",
+                        vec![
+                            ("Height", job.height.to_string()),
+                            ("Reward", "Sent to your payout address".into()),
+                        ],
+                        0x2ecc71,
+                    );
                 } else {
                     warn!(height = job.height, resp = %v, "block rejected by node");
                     state.lock().await.last_block_result = format!("rejected: {v}");
+                    discord_notify(
+                        "rejected",
+                        "❌ Block candidate rejected by node",
+                        vec![("Height", job.height.to_string()), ("Reason", format!("{v}"))],
+                        0xe74c3c,
+                    );
                 }
             }
             Err(e) => {
                 error!("block submit failed: {e:#}");
                 state.lock().await.last_block_result = format!("submit failed: {e:#}");
+                discord_notify(
+                    "failed",
+                    "❌ Block submission failed",
+                    vec![
+                        ("Height", job.height.to_string()),
+                        ("Error", format!("{e:#}")),
+                    ],
+                    0xe74c3c,
+                );
             }
         }
     }
@@ -1450,6 +1505,99 @@ async fn handle_share(
         .send(MiningDeviceMessages::Mining(Mining::SubmitSharesSuccess(resp)))
         .await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Discord notifications (NP_DISCORD_WEBHOOK / .pool-webhook)
+//
+// Fire-and-forget: spawned tasks never delay share acks. Sends are
+// serialized through a global queue and retried on 429 with the
+// server-provided backoff. Also honored from a repo-root file
+// `.pool-webhook` so the secret never has to live in shell history.
+// ---------------------------------------------------------------------------
+
+fn discord_config() -> Option<String> {
+    if let Ok(u) = std::env::var("NP_DISCORD_WEBHOOK") {
+        if !u.trim().is_empty() {
+            return Some(u.trim().to_string());
+        }
+    }
+    for f in ["/work/.pool-webhook", ".pool-webhook"] {
+        if let Ok(s) = std::fs::read_to_string(f) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn coin_label() -> String {
+    std::env::var("NP_COIN_LABEL").unwrap_or_else(|_| "BCH".into())
+}
+
+async fn discord_post(webhook: String, embed: serde_json::Value) {
+    // Serialize sends + hold a shared client so retries queue politely.
+    static CH: std::sync::OnceLock<async_channel::Sender<(String, serde_json::Value)>> =
+        std::sync::OnceLock::new();
+    let tx = CH.get_or_init(|| {
+        let (tx, rx) = async_channel::unbounded::<(String, serde_json::Value)>();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            while let Ok((url, embed)) = rx.recv().await {
+                let body = json!({ "embeds": [embed] });
+                for attempt in 0..3u32 {
+                    match client
+                        .post(&url)
+                        .json(&body)
+                        .timeout(Duration::from_secs(10))
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status() == 429 => {
+                            let wait = r
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or((2 + attempt * 2) as u64);
+                            tracing::warn!(wait, "discord rate limited, waiting");
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                        }
+                        Ok(r) if r.status().is_success() => break,
+                        Ok(r) => {
+                            tracing::warn!(status = %r.status(), "discord webhook error");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "discord webhook unreachable");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+        });
+        tx
+    });
+    let _ = tx.send((webhook, embed)).await;
+}
+
+fn discord_notify(kind: &str, title: &str, fields: Vec<(&str, String)>, color: u32) {
+    if let Some(webhook) = discord_config() {
+        let footer = format!("nano-pool · {}", coin_label());
+        let embed = json!({
+            "title": title,
+            "color": color,
+            "fields": fields
+                .into_iter()
+                .map(|(k, v)| json!({ "name": k, "value": v, "inline": true }))
+                .collect::<Vec<_>>(),
+            "footer": { "text": footer },
+        });
+        tokio::spawn(discord_post(webhook, embed));
+    }
+    let _ = kind;
 }
 
 // ---------------------------------------------------------------------------
