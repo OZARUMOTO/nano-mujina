@@ -24,6 +24,10 @@ switching happens host-side only.
 - `NP_RPC=http://xec-mainnet:8432` + XEC rpcauth password
 - `NP_PAYOUT=ecash:...` (cashaddr payload is prefix-agnostic — same
   20-byte pkh as BCH, but XEC wallet expects ecash-prefixed addr)
+- `NP_COIN_LABEL=XEC` → stats panel + Discord footer say "nano-pool · XEC"
+  (the BCH container carries `NP_COIN_LABEL=BCH` the same way)
+- Discord notifications: webhook shared via the repo-root gitignored
+  `.pool-webhook` file — both pools read it, no per-container secret
 
 ## Coin switch (single pool at a time)
 

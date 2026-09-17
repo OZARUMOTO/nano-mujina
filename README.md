@@ -401,9 +401,16 @@ docker run -d --name nano-pool --restart unless-stopped \
   -e NP_USER=<node-rpc-user> \
   -e NP_PASS=<node-rpc-pass> \
   -e NP_PAYOUT=bitcoincash:q... \
+  -e NP_COIN_LABEL=BCH \
   -e RUST_LOG=info \
   nano3s-build bash -lc "cargo run --release -p nano-pool --bin nano-pool"
 ```
+
+`NP_COIN_LABEL` names the coin in the solo-stats panel and Discord
+notification footers. Discord alerts (new best share, block candidate,
+block accepted/rejected) fire when `NP_DISCORD_WEBHOOK` is set — or
+place the webhook URL in a gitignored `.pool-webhook` file at the repo
+root, which every nano-pool container picks up automatically.
 
 Then point the miner at it from the dashboard's GLOBAL SETTINGS (or
 `POST /minersettings`):
