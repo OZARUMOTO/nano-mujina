@@ -24,7 +24,3 @@ rtos_core/vendor/
 # Generated boot logo (binary asset -- regenerate from source art with
 # tools/make_bootlogo.py, see README's Custom Boot Logo section)
 tools/bootlogo.rgb565
-
-.dgb-rpc-pass
-.dgb_rpc_pass
-deploy/dgb-build/
