@@ -143,13 +143,6 @@ struct Config {
     /// Bitcoin-Core getblocktemplate (DigiByte)
     gbt_light: bool,
     payout_pkh: [u8; 20],
-    /// Full payout script for the coinbase output: P2PKH (25 B) for
-    /// cashaddr/base58, P2WPKH (22 B) for bech32 (DigiByte's default
-    /// `dgb1q…` addresses are SegWit-native).
-    payout_script: Vec<u8>,
-    /// P2WPKH payouts additionally require a BIP141 witness commitment
-    /// output in the coinbase (output 1, after the payout).
-    segwit: bool,
     /// Original payout address (display in the status panel)
     payout: String,
     worker_tag: Vec<u8>,
@@ -159,8 +152,7 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let payout = std::env::var("NP_PAYOUT")
-            .context("NP_PAYOUT (payout address receiving solo block rewards) required")?;
-        let ps = payout_script(&payout)?;
+            .context("NP_PAYOUT (BCH address receiving solo block rewards) required")?;
         Ok(Self {
             listen: std::env::var("NP_LISTEN").unwrap_or_else(|_| "0.0.0.0:3334".into()),
             rpc_url: std::env::var("NP_RPC").unwrap_or_else(|_| "http://127.0.0.1:18443".into()),
@@ -169,9 +161,7 @@ impl Config {
             gbt_light: std::env::var("NP_NODE")
                 .unwrap_or_else(|_| "bchn".into())
                 .eq_ignore_ascii_case("bchn"),
-            payout_pkh: ps.pkh,
-            payout_script: ps.script,
-            segwit: ps.segwit,
+            payout_pkh: decode_payout(&payout)?,
             payout,
             worker_tag: std::env::var("NP_WORKER_TAG")
                 .unwrap_or_else(|_| "OPNANO".into())
@@ -196,110 +186,6 @@ fn decode_payout(addr: &str) -> Result<[u8; 20]> {
     cashaddr_decode("bitcoincash", a)
         .or_else(|_| cashaddr_decode("bchreg", a))
         .or_else(|_| base58check_pkh(a))
-}
-
-/// Resolved payout: the 20-byte key hash plus the full output script the
-/// coinbase pays to.
-struct PayoutScript {
-    pkh: [u8; 20],
-    script: Vec<u8>,
-    segwit: bool,
-}
-
-/// Resolve an address to its output script. Bech32 (P2WPKH v0) first —
-/// DigiByte's default `dgb1q…` — then cashaddr/base58 P2PKH.
-fn payout_script(addr: &str) -> Result<PayoutScript> {
-    let a = addr.trim();
-    for hrp in ["dgb", "bc", "tb", "ltc"] {
-        if let Ok(prog) = bech32_segwit_v0(hrp, a) {
-            let mut script = vec![0x00, 0x14];
-            script.extend_from_slice(&prog);
-            return Ok(PayoutScript {
-                pkh: prog,
-                script,
-                segwit: true,
-            });
-        }
-    }
-    let pkh = decode_payout(a)?;
-    let mut script = Vec::with_capacity(25);
-    script.extend_from_slice(&[0x76, 0xa9, 0x14]);
-    script.extend_from_slice(&pkh);
-    script.extend_from_slice(&[0x88, 0xac]);
-    Ok(PayoutScript {
-        pkh,
-        script,
-        segwit: false,
-    })
-}
-
-/// BIP173 bech32 decode of a v0 witness program (20-byte P2WPKH). Full
-/// checksum validation (polymod == 1 over hrp + data incl. check chars).
-fn bech32_segwit_v0(hrp: &str, addr: &str) -> Result<[u8; 20]> {
-    const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    let a = addr.to_lowercase();
-    let rest = a
-        .strip_prefix(hrp)
-        .and_then(|r| r.strip_prefix('1'))
-        .ok_or_else(|| anyhow!("not bech32 {hrp}1…"))?;
-    let mut data = Vec::with_capacity(rest.len());
-    for c in rest.bytes() {
-        let v = CHARSET
-            .iter()
-            .position(|&x| x == c)
-            .ok_or_else(|| anyhow!("bad bech32 char '{c}'"))?;
-        data.push(v as u8);
-    }
-    // v0 P2WPKH: 1 version group + 32 program groups + 6 check chars
-    if data.len() != 39 || data[0] != 0 {
-        return Err(anyhow!("not a v0 P2WPKH bech32 program"));
-    }
-    let mut poly: Vec<u8> = hrp.bytes().map(|b| b >> 5).collect();
-    poly.push(0);
-    poly.extend(hrp.bytes().map(|b| b & 31));
-    poly.extend_from_slice(&data);
-    if bech32_polymod(&poly) != 1 {
-        return Err(anyhow!("bech32 checksum mismatch"));
-    }
-    // regroup 5→8 bits: 32 groups = exactly 160 bits = 20 bytes
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    let mut out = [0u8; 20];
-    let mut n = 0;
-    for &g in &data[1..33] {
-        acc = (acc << 5) | g as u32;
-        bits += 5;
-        while bits >= 8 {
-            bits -= 8;
-            out[n] = (acc >> bits) as u8;
-            n += 1;
-        }
-    }
-    if n != 20 {
-        return Err(anyhow!("bad P2WPKH program length"));
-    }
-    Ok(out)
-}
-
-fn bech32_polymod(v: &[u8]) -> u64 {
-    const G: [u64; 5] = [
-        0x3b6a_57b2,
-        0x2650_8e6d,
-        0x1ea1_19fa,
-        0x3d42_33dd,
-        0x2a14_62b3,
-    ];
-    let mut c: u64 = 1;
-    for &d in v {
-        let c0 = c >> 25;
-        c = ((c & 0x01ff_ffff) << 5) ^ d as u64;
-        for (i, g) in G.iter().enumerate() {
-            if (c0 >> i) & 1 == 1 {
-                c ^= g;
-            }
-        }
-    }
-    c
 }
 
 /// Legacy base58check P2PKH: 1 version byte + 20-byte hash160 + 4-byte
@@ -455,26 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn bech32_dgb_p2wpkh() {
-        // validated against digibyte-cli validateaddress (witness_program)
-        let ps = payout_script("dgb1qecvsnv747qa8h2cpfqnde4ut767vgvvrvj5z3n")
-            .expect("DGB bech32 address decodes");
-        assert!(ps.segwit);
-        assert_eq!(
-            hex::encode(ps.pkh),
-            "ce1909b3d5f03a7bab014826dcd78bf6bcc43183"
-        );
-        assert_eq!(
-            hex::encode(&ps.script),
-            "0014ce1909b3d5f03a7bab014826dcd78bf6bcc43183"
-        );
-        // P2PKH addresses still resolve through the legacy path
-        assert!(!payout_script("D76edx2imfErFaHrh5fFwWNVKgWfojh2sa")
-            .expect("legacy decodes")
-            .segwit);
-    }
-
-    #[test]
     fn coinbase_merkle_branch_golden() {
         // 3 txs, odd level duplicates its last node; branch = [b, H(c,c)]
         let a = int_leaf(1);
@@ -531,9 +397,6 @@ struct NodeTemplate {
     /// merkle path, internal byte order
     merkle_branch: Vec<[u8; 32]>,
     coinbase_value: u64,
-    /// BIP141 wtxid-merkle root (coinbase treated as zeroes) for the
-    /// witness commitment; zeroes on BCH (no segwit).
-    witness_root: [u8; 32],
     bits: u32,
     min_ntime: u32,
     /// block version from the node, forwarded verbatim (DigiByte encodes
@@ -592,7 +455,6 @@ async fn fetch_template_light(cfg: &Config) -> Result<NodeTemplate> {
         prev_hash: t["previousblockhash"].as_str().context("no prev")?.parse()?,
         merkle_branch: branch,
         coinbase_value: t["coinbasevalue"].as_u64().context("no value")?,
-        witness_root: [0u8; 32],
         bits: u32::from_str_radix(t["bits"].as_str().context("no bits")?, 16)?,
         min_ntime: t["mintime"].as_u64().unwrap_or(0) as u32,
         version: t["version"].as_i64().unwrap_or(0x2000_0000) as u32,
@@ -613,31 +475,16 @@ async fn fetch_template_std(cfg: &Config) -> Result<NodeTemplate> {
     let mintime = t["mintime"].as_u64().unwrap_or(0) as u32;
 
     // txids arrive in display (block-hash) order; the climb runs in
-    // internal order, so reverse each. BIP141: with segwit active the
-    // coinbase tree commits WTXIDs — prefer the wtxid (identical hash for
-    // non-witness txs).
+    // internal order, so reverse each.
     let txs = t["transactions"].as_array().context("no transactions")?;
     let mut ids: Vec<[u8; 32]> = Vec::with_capacity(txs.len());
-    let mut wleaves: Vec<[u8; 32]> = vec![[0u8; 32]]; // coinbase → zeroes
     for tx in txs {
-        let s = tx["wtxid"]
-            .as_str()
-            .or_else(|| tx["txid"].as_str())
-            .context("no txid")?;
+        let s = tx["txid"].as_str().context("no txid")?;
         let mut b = [0u8; 32];
         hex::decode_to_slice(s, &mut b)?;
         b.reverse();
         ids.push(b);
-        if let Some(s) = tx["wtxid"].as_str() {
-            let mut w = [0u8; 32];
-            hex::decode_to_slice(s, &mut w)?;
-            w.reverse();
-            wleaves.push(w);
-        }
     }
-    // BIP141 witness root: wtxid merkle with the coinbase treated as
-    // all-zeroes (the commitment tree excludes the coinbase itself).
-    let witness_root = merkle_root(wleaves);
     let mut branch = coinbase_merkle_branch(&ids);
     for n in branch.iter_mut() {
         n.reverse(); // store display-order nodes, like the light path
@@ -652,7 +499,6 @@ async fn fetch_template_std(cfg: &Config) -> Result<NodeTemplate> {
     id_src.extend_from_slice(&version.to_le_bytes());
     id_src.extend_from_slice(&bits.to_le_bytes());
     id_src.extend_from_slice(&coinbase_value.to_le_bytes());
-    id_src.extend_from_slice(&witness_root);
     id_src.extend_from_slice(&root);
     Ok(NodeTemplate {
         job_id: hex::encode(Sha256d::hash(&id_src).to_byte_array()),
@@ -660,7 +506,6 @@ async fn fetch_template_std(cfg: &Config) -> Result<NodeTemplate> {
         prev_hash,
         merkle_branch: branch,
         coinbase_value,
-        witness_root,
         bits,
         min_ntime: mintime,
         version,
@@ -687,25 +532,6 @@ fn coinbase_merkle_branch(ids: &[[u8; 32]]) -> Vec<[u8; 32]> {
         level = next;
     }
     branch
-}
-
-/// Fold a full leaf list to its merkle root (odd levels duplicate their
-/// last node, matching the node's TransactionMerkleTree).
-fn merkle_root(mut level: Vec<[u8; 32]>) -> [u8; 32] {
-    while level.len() > 1 {
-        if level.len() % 2 == 1 {
-            level.push(*level.last().unwrap());
-        }
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for p in level.chunks(2) {
-            let mut buf = [0u8; 64];
-            buf[..32].copy_from_slice(&p[0]);
-            buf[32..].copy_from_slice(&p[1]);
-            next.push(Sha256d::hash(&buf).to_byte_array());
-        }
-        level = next;
-    }
-    level[0]
 }
 
 /// Root-shaped fold over sibling txids — a template fingerprint, not the
@@ -783,26 +609,12 @@ fn build_coinbase(tpl: &NodeTemplate, cfg: &Config) -> Coinbase {
 
     let mut suffix = Vec::with_capacity(46);
     suffix.extend_from_slice(&0xffffffffu32.to_le_bytes()); // sequence
-    suffix.push(if cfg.segwit { 2 } else { 1 }); // output count
+    suffix.push(1); // output count
     suffix.extend_from_slice(&tpl.coinbase_value.to_le_bytes());
-    let script = &cfg.payout_script;
-    suffix.push(script.len() as u8);
-    suffix.extend_from_slice(script);
-    if cfg.segwit {
-        // BIP141 witness commitment (required when a segwit output is
-        // paid): output 1, value 0, script `OP_RETURN PUSH32 aa21a9ed
-        // <commit>`, commit = hash256(witness_root ‖ 0^32 reserved). The
-        // root is computed at template time — the commitment tree treats
-        // the coinbase as zeroes, so there is no circularity — and is
-        // stable for the job: the device hashes the final coinbase.
-        let mut seed = [0u8; 64];
-        seed[..32].copy_from_slice(&tpl.witness_root);
-        let commit = Sha256d::hash(&seed).to_byte_array();
-        suffix.extend_from_slice(&0u64.to_le_bytes()); // value 0
-        suffix.push(0x26); // 38-byte script
-        suffix.extend_from_slice(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]);
-        suffix.extend_from_slice(&commit);
-    }
+    suffix.push(25); // P2PKH script length
+    suffix.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    suffix.extend_from_slice(&cfg.payout_pkh);
+    suffix.extend_from_slice(&[0x88, 0xac]);
     suffix.extend_from_slice(&0u32.to_le_bytes()); // nLockTime (tx terminator)
     Coinbase { prefix, suffix }
 }
@@ -1632,14 +1444,7 @@ async fn handle_share(
             st.block_found = true;
         }
         let cfg = state.lock().await.cfg.clone();
-        // BCHN's submitblocklight takes (block_hex, job_id); standard
-        // Core (DigiByte) only has submitblock with the bare hex.
-        let (submit_method, submit_params) = if cfg.gbt_light {
-            ("submitblocklight", json!([block_hex, job.node_job_id]))
-        } else {
-            ("submitblock", json!([block_hex]))
-        };
-        match rpc(&cfg, submit_method, submit_params).await {
+        match rpc(&cfg, "submitblocklight", json!([block_hex, job.node_job_id])).await {
             Ok(v) => {
                 if v.is_null() {
                     error!(height = job.height, "*** BLOCK ACCEPTED — SOLO BLOCK! ***");
