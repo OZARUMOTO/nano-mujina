@@ -1,0 +1,25 @@
+# Minimal DigiByte node image — official DigiByte Core binary only.
+# Built locally so we never trust a third-party node image for mining.
+#
+# Source binary: https://github.com/DigiByte-Core/digibyte/releases/tag/v9.26.5
+#   digibyte-9.26.5-x86_64-linux-gnu.tar.gz
+# Verified sha256 (macOS `shasum -a 256`):
+#   digibyted    45e1dd11111d0d16d599dd6c191ff7d1eea37c00c8edc2cac3ae81395d734b2f
+#   digibyte-cli 58a358b66a4fbddea4602d105046f6679f6119403b0450e4a3f2e2e1a6cca678
+FROM ubuntu:22.04
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libzmq5 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY digibyted /usr/local/bin/digibyted
+COPY digibyte-cli /usr/local/bin/digibyte-cli
+
+# Runtime fails loudly if the copied binary was tampered with.
+RUN echo "45e1dd11111d0d16d599dd6c191ff7d1eea37c00c8edc2cac3ae81395d734b2f  /usr/local/bin/digibyted" > /tmp/sha && \
+    echo "58a358b66a4fbddea4602d105046f6679f6119403b0450e4a3f2e2e1a6cca678  /usr/local/bin/digibyte-cli" >> /tmp/sha && \
+    sha256sum -c /tmp/sha && rm /tmp/sha
+
+EXPOSE 12024 14022
+
+ENTRYPOINT ["/usr/local/bin/digibyted"]
